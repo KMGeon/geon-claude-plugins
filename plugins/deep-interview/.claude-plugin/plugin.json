@@ -1,0 +1,17 @@
+{
+  "name": "deep-interview",
+  "version": "0.1.0",
+  "description": "코드 작업 전 일대일 요구사항 인터뷰. 한 번에 한 질문, 가장 흐릿한 곳부터, 매번 모호도 점수 공개, 기준 아래로 내려오면 스펙 저장 후 멈춤.",
+  "author": {
+    "name": "KMGeon"
+  },
+  "repository": "https://github.com/KMGeon/geon-claude-plugins",
+  "license": "MIT",
+  "keywords": [
+    "interview",
+    "requirements",
+    "spec",
+    "brainstorming",
+    "socratic"
+  ]
+}

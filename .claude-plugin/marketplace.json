@@ -1,0 +1,17 @@
+{
+  "name": "geon-claude-plugins",
+  "owner": {
+    "name": "KMGeon"
+  },
+  "metadata": {
+    "description": "KMGeon의 개인 Claude Code 플러그인 모음"
+  },
+  "plugins": [
+    {
+      "name": "deep-interview",
+      "source": "./plugins/deep-interview",
+      "description": "코드 작업 전 일대일 요구사항 인터뷰와 모호도 점수",
+      "version": "0.1.0"
+    }
+  ]
+}
