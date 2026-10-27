@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { checkDesign, checkPlan, parseSpec, readState, run } from "../skills/deep-build/scripts/build.mjs";
+import { checkDesign, checkPlan, parseSpec, readState, run, taskOrder, runCommand } from "../skills/deep-build/scripts/build.mjs";
 import { evaluate } from "../hooks/guard.mjs";
 
 const SID = "build-session";
@@ -71,15 +71,17 @@ const jsonFile = (root, name, value) => {
 	fs.writeFileSync(file, JSON.stringify(value));
 	return `@${file}`;
 };
-const started = root => cli(root, "start", "--spec", ".deep-interview/specs/deep-interview-leave.md");
+const started = (root, ...extra) => cli(root, "start", "--spec", ".deep-interview/specs/deep-interview-leave.md", ...extra);
 const withDesign = root => {
 	started(root);
 	fs.mkdirSync(path.join(root, ".deep-interview/designs"), { recursive: true });
 	fs.writeFileSync(path.join(root, ".deep-interview/designs/leave.md"), DESIGN_OK);
 	return cli(root, "design", "--file", ".deep-interview/designs/leave.md");
 };
-const task = (id, covers, extra = {}) => ({ id, title: `작업 ${id}`, files: ["src/a.ts"], interface: "f() → x", test: "실패 테스트", covers, depends_on: [], ...extra });
-const FULL_PLAN = { tasks: [task("T1", { fixed: ["화면:신청폼"], criteria: ["AC-1", "AC-3"] }), task("T2", { fixed: ["연결:슬랙"], criteria: ["AC-2"] }, { depends_on: ["T1"] })] };
+const task = (id, covers, extra = {}) => ({ id, title: `작업 ${id}`, files: ["src/a.ts"], interface: "f() → x", test: "실패 테스트", test_cmd: "exit 0", covers, depends_on: [], ...extra });
+const EVIDENCE = { "AC-1": { cmd: "exit 0", note: "DM 테스트" }, "AC-2": { cmd: "exit 0" }, "AC-3": { cmd: "echo ok" } };
+const FULL_PLAN = { tasks: [task("T1", { fixed: ["화면:신청폼"], criteria: ["AC-1", "AC-3"] }), task("T2", { fixed: ["연결:슬랙"], criteria: ["AC-2"] }, { depends_on: ["T1"] })], evidence: EVIDENCE };
+const OK_CRITERIA = { "AC-1": "ok", "AC-2": "ok", "AC-3": "ok" };
 
 test("parseSpec: 제목, 결과, 고정 항목, 완료 기준(AC-n)을 뽑는다", () => {
 	const spec = parseSpec(SPEC);
@@ -91,10 +93,18 @@ test("parseSpec: 제목, 결과, 고정 항목, 완료 기준(AC-n)을 뽑는다
 	// 남은 질문의 체크박스는 완료 기준으로 세지 않는다
 });
 
+test("parseSpec: 양식 줄을 그대로 둔 결과는 통과가 아니고, 고정 항목은 제목·굵은 글씨 형식도 읽는다", () => {
+	assert.equal(parseSpec("# t\n- 결과: 기준 통과 | 기준 미달로 조기 종료\n").passed, false);
+	assert.equal(parseSpec("# t\n- 결과: 기준 통과하지 않음\n").passed, false);
+	assert.equal(parseSpec("# t\n- 결과: 기준 통과 \n").passed, true);
+	const alt = parseSpec("# t\n### 고정 항목\n- **화면:폼** — 폼\n- `연결:슬랙`: 알림\n## 다 됐다는 기준\n- [ ] a\n");
+	assert.deepEqual(alt.fixed_items.map(i => i.id), ["화면:폼", "연결:슬랙"]);
+});
+
 test("start: 기준 미달 스펙은 --force 없이 거부한다", () => {
 	const root = project(SPEC.replace("기준 통과", "기준 미달로 조기 종료"));
 	assert.throws(() => started(root), /조기 종료된 스펙/);
-	const forced = cli(root, "start", "--spec", ".deep-interview/specs/deep-interview-leave.md", "--force");
+	const forced = started(root, "--force");
 	assert.equal(forced.status, "designing");
 	assert.equal(readState(root, SID).forced, true);
 });
@@ -105,6 +115,40 @@ test("start: 완료 기준 ID와 고정 항목을 돌려준다", () => {
 	assert.equal(r.slug, "leave");
 	assert.deepEqual(r.fixed_items, ["화면:신청폼", "연결:슬랙"]);
 	assert.equal(r.criteria.length, 3);
+	assert.equal(r.interview_checked, false);
+});
+
+test("start: 인터뷰 상태가 있으면 빠진 고정 항목과 조기 종료를 대조한다", () => {
+	const root = project();
+	const sessionDir = path.join(root, ".deep-interview/sessions/iv-1");
+	fs.mkdirSync(sessionDir, { recursive: true });
+	const interview = { spec_path: ".deep-interview/specs/deep-interview-leave.md", fixed_items: [{ id: "화면:신청폼" }, { id: "연결:슬랙" }, { id: "화면:승인함" }], early_exit: false, ended_at: "2026-10-27T00:00:00Z" };
+	fs.writeFileSync(path.join(sessionDir, "state.json"), JSON.stringify(interview));
+	assert.throws(() => started(root), /빠진 고정 항목.*화면:승인함/);
+	fs.writeFileSync(path.join(sessionDir, "state.json"), JSON.stringify({ ...interview, fixed_items: interview.fixed_items.slice(0, 2), early_exit: true }));
+	assert.throws(() => started(root), /조기 종료된 스펙/); // 글에는 "기준 통과"라고 적혀 있어도 인터뷰 상태를 믿는다
+	fs.writeFileSync(path.join(sessionDir, "state.json"), JSON.stringify({ ...interview, fixed_items: interview.fixed_items.slice(0, 2) }));
+	assert.equal(started(root).interview_checked, true);
+});
+
+test("start: 고정 항목을 하나도 못 읽으면 경고를 돌려준다", () => {
+	const root = project(SPEC.replace("**고정 항목**", "고정 항목 목록"));
+	const r = started(root);
+	assert.deepEqual(r.fixed_items, []);
+	assert.match(r.warnings[0], /고정 항목을 찾지 못했습니다/);
+});
+
+test("start: 진행 중인 빌드는 --restart 없이 덮어쓰지 않고, 끝난 빌드는 보관 후 새로 시작한다", () => {
+	const root = planned(project());
+	assert.throws(() => started(root), /진행 중인 빌드.*planned.*--restart/);
+	assert.equal(started(root, "--restart").status, "designing");
+	const builds = fs.readdirSync(path.join(root, ".deep-interview/builds"));
+	assert.equal(builds.filter(f => f.startsWith(`${SID}-`)).length, 1); // 버린 빌드도 보관된다
+
+	const done = finished(planned(project()));
+	cli(done, "final-review", "--input", jsonFile(done, "fr.json", { verdict: "pass", criteria: OK_CRITERIA, findings: [] }));
+	assert.equal(readState(done, SID).status, "done");
+	assert.equal(started(done).status, "designing"); // done은 --restart 없이도 새로 시작
 });
 
 test("checkDesign: 네 절이 모두 있고 내용이나 생략 이유가 있어야 한다", () => {
@@ -125,22 +169,36 @@ test("design: 등록하면 planning이 되고, 빈 절이 있으면 거부한다
 test("checkPlan: 고정 항목·완료 기준에 담당 작업이 없으면 거부한다", () => {
 	const spec = parseSpec(SPEC);
 	assert.deepEqual(checkPlan(FULL_PLAN, spec), []);
-	const partial = { tasks: [task("T1", { fixed: ["화면:신청폼"], criteria: ["AC-1"] })] };
+	const partial = { tasks: [task("T1", { fixed: ["화면:신청폼"], criteria: ["AC-1"] })], evidence: EVIDENCE };
 	const problems = checkPlan(partial, spec);
 	assert.ok(problems.some(p => p.includes("고정 항목: 연결:슬랙")));
 	assert.ok(problems.some(p => p.includes("완료 기준: AC-2, AC-3")));
 });
 
-test("checkPlan: 빈 필드, 없는 ID, 잘못된 의존을 잡는다", () => {
+test("checkPlan: 빈 필드, 없는 ID, 잘못된 의존, 빠진 테스트·증거 명령을 잡는다", () => {
 	const spec = parseSpec(SPEC);
 	const bad = { tasks: [{ id: "T1", title: "x", files: [], covers: { fixed: ["없음"], criteria: ["AC-9"] }, depends_on: ["T7", "T1"] }] };
 	const problems = checkPlan(bad, spec);
-	for (const needle of ["files", "interface", "test", "없는 고정 항목 없음", "없는 완료 기준 AC-9", "T7", "자기 자신"]) {
+	for (const needle of ["files", "interface", "test(", "test_cmd", "없는 고정 항목 없음", "없는 완료 기준 AC-9", "T7", "자기 자신", "evidence가 필요"]) {
 		assert.ok(problems.some(p => p.includes(needle)), needle);
 	}
+	const noEvidence = checkPlan({ ...FULL_PLAN, evidence: { "AC-1": { cmd: "x" }, "AC-9": { cmd: "y" } } }, spec);
+	assert.ok(noEvidence.some(p => p.includes("evidence.AC-2.cmd")));
+	assert.ok(noEvidence.some(p => p.includes("스펙에 없는 완료 기준 AC-9")));
 });
 
-test("plan: 통과하면 계획 파일을 쓰고 reviewing이 된다", () => {
+test("checkPlan: 의존 순환과 배열이 아닌 covers·depends_on을 거부한다", () => {
+	const spec = parseSpec(SPEC);
+	const cyclic = { tasks: [task("T1", { fixed: ["화면:신청폼", "연결:슬랙"], criteria: ["AC-1", "AC-2", "AC-3"] }, { depends_on: ["T2"] }), task("T2", { fixed: [], criteria: [] }, { depends_on: ["T1"] })], evidence: EVIDENCE };
+	assert.ok(checkPlan(cyclic, spec).some(p => p.includes("순환")));
+	const stringy = { tasks: [task("T1", { fixed: "화면:신청폼", criteria: ["AC-1"] }, { depends_on: "T1" })], evidence: EVIDENCE };
+	const problems = checkPlan(stringy, spec);
+	assert.ok(problems.some(p => p.includes("covers.fixed는 배열")));
+	assert.ok(problems.some(p => p.includes("depends_on은 배열")));
+	assert.ok(!problems.some(p => p.includes("고정 항목 화"))); // 글자 단위로 돌지 않는다
+});
+
+test("plan: 통과하면 계획 파일(테스트 명령·증거 명령 포함)을 쓰고 reviewing이 된다", () => {
 	const root = project();
 	withDesign(root);
 	const r = cli(root, "plan", "--input", jsonFile(root, "plan.json", FULL_PLAN));
@@ -150,16 +208,17 @@ test("plan: 통과하면 계획 파일을 쓰고 reviewing이 된다", () => {
 	assert.match(md, /## 연결 표/);
 	assert.match(md, /\| AC-2 \| 승인하면 남은 일수가 준다 \| T2 \|/);
 	assert.match(md, /먼저 실패할 테스트: 실패 테스트/);
+	assert.match(md, /테스트 명령: `exit 0`/);
+	assert.match(md, /\| AC-1 \| `exit 0` \| DM 테스트 \|/);
 });
 
 test("plan: 설계 전에는 거부하고, 연결이 빠지면 거부한다", () => {
 	const root = project();
 	started(root);
-	assert.throws(() => cli(root, "plan", "--input", jsonFile(root, "p.json", FULL_PLAN)), /planning\/revising 상태/);
-	withDesign(project()); // 별도 프로젝트에서 설계 등록 흐름 확인
+	assert.throws(() => cli(root, "plan", "--input", jsonFile(root, "p.json", FULL_PLAN)), /검토 통과 전/);
 	const root2 = project();
 	withDesign(root2);
-	assert.throws(() => cli(root2, "plan", "--input", jsonFile(root2, "p.json", { tasks: [task("T1", { fixed: ["화면:신청폼"], criteria: ["AC-1"] })] })), /담당 작업이 없는/);
+	assert.throws(() => cli(root2, "plan", "--input", jsonFile(root2, "p.json", { tasks: [task("T1", { fixed: ["화면:신청폼"], criteria: ["AC-1"] })], evidence: EVIDENCE })), /담당 작업이 없는/);
 });
 
 test("review: pass면 planned, revise는 3회까지, 넘으면 stuck", () => {
@@ -176,7 +235,7 @@ test("review: pass면 planned, revise는 3회까지, 넘으면 stuck", () => {
 	const third = cli(root, "review", "--input", jsonFile(root, "rv.json", revise));
 	assert.equal(third.status, "stuck");
 	assert.equal(third.rounds_left, 0);
-	assert.throws(() => cli(root, "plan", "--input", jsonFile(root, "plan.json", FULL_PLAN)), /planning\/revising 상태/);
+	assert.throws(() => cli(root, "plan", "--input", jsonFile(root, "plan.json", FULL_PLAN)), /검토 통과 전/);
 
 	const root2 = project();
 	withDesign(root2);
@@ -192,11 +251,23 @@ test("review: revise에는 findings가 있어야 하고, reviewing 상태에서�
 	assert.throws(() => cli(root, "review", "--input", jsonFile(root, "rv.json", { verdict: "revise", findings: [] })), /findings가 하나 이상/);
 });
 
-test("가드 훅: plans/와 builds/는 직접 쓸 수 없고 designs/는 된다", () => {
+test("revise 뒤 설계만 다시 등록해도 reviewing으로 돌아가고, reviewing에서도 설계·계획을 다시 등록할 수 있다", () => {
+	const root = project();
+	withDesign(root);
+	cli(root, "plan", "--input", jsonFile(root, "plan.json", FULL_PLAN));
+	cli(root, "review", "--input", jsonFile(root, "rv.json", { verdict: "revise", findings: [{ target: "설계/시퀀스", finding: "흐름 빠짐" }] }));
+	assert.equal(cli(root, "design", "--file", ".deep-interview/designs/leave.md").status, "reviewing");
+	assert.equal(cli(root, "design", "--file", ".deep-interview/designs/leave.md").status, "reviewing"); // 검토 전 오타 수정
+	assert.equal(cli(root, "plan", "--input", jsonFile(root, "plan.json", FULL_PLAN)).status, "reviewing");
+	assert.equal(cli(root, "review", "--input", jsonFile(root, "rv.json", { verdict: "pass", findings: [] })).status, "planned");
+});
+
+test("가드 훅: sessions/·plans/·builds/는 직접 쓸 수 없고 designs/는 된다", () => {
 	const root = project();
 	const call = file => evaluate({ tool_name: "Write", cwd: root, tool_input: { file_path: path.join(root, file) } });
 	assert.match(call(".deep-interview/plans/leave.md"), /직접 쓸 수 없습니다/);
 	assert.match(call(".deep-interview/builds/x.json"), /직접 쓸 수 없습니다/);
+	assert.match(call(".deep-interview/sessions/s/state.json"), /직접 고칠 수 없습니다/);
 	assert.equal(call(".deep-interview/designs/leave.md"), null);
 	assert.equal(call("src/app.ts"), null);
 	assert.equal(evaluate({ tool_name: "Bash", cwd: root, tool_input: { command: "ls" } }), null);
@@ -205,7 +276,6 @@ test("가드 훅: plans/와 builds/는 직접 쓸 수 없고 designs/는 된다"
 // ---------------------------------------------------------------------------
 // 2단계: 구현 → 완료 판정
 // ---------------------------------------------------------------------------
-import { taskOrder, runCommand } from "../skills/deep-build/scripts/build.mjs";
 
 /** 검토를 통과해 planned 상태인 프로젝트. */
 function planned(root, plan = FULL_PLAN) {
@@ -214,12 +284,20 @@ function planned(root, plan = FULL_PLAN) {
 	cli(root, "review", "--input", jsonFile(root, "rv.json", { verdict: "pass", findings: [] }));
 	return root;
 }
+/** 모든 작업과 verify까지 끝난 프로젝트. */
+function finished(root) {
+	cli(root, "execute");
+	cli(root, "task-done", "--task", "T1");
+	cli(root, "task-done", "--task", "T2");
+	assert.equal(cli(root, "verify").passed, true);
+	return root;
+}
 const BIG_PLAN = { tasks: [
 	task("T1", { fixed: ["화면:신청폼"], criteria: ["AC-1"] }),
 	task("T2", { fixed: [], criteria: ["AC-2"] }, { depends_on: ["T1"] }),
 	task("T3", { fixed: ["연결:슬랙"], criteria: [] }),
 	task("T4", { fixed: [], criteria: ["AC-3"] }, { depends_on: ["T2", "T3"] }),
-] };
+], evidence: EVIDENCE };
 
 test("taskOrder: 의존을 지키고 순환은 거부한다", () => {
 	assert.deepEqual(taskOrder(BIG_PLAN.tasks), ["T1", "T2", "T3", "T4"]);
@@ -243,83 +321,112 @@ test("execute: planned에서만 시작하고, 작업 수로 방식을 정한다"
 	assert.equal(big.next_task, "T1");
 });
 
-test("task-done: 코드가 테스트를 실행하고, 순서를 어기면 거부한다", () => {
-	const root = planned(project());
+test("task-done: 계획에 고정된 테스트 명령을 코드가 실행하고, --cmd는 받지 않으며, 순서를 어기면 거부한다", () => {
+	const plan = { ...FULL_PLAN, tasks: [task("T1", { fixed: ["화면:신청폼"], criteria: ["AC-1", "AC-3"] }, { test_cmd: "test -f t1.ok" }), FULL_PLAN.tasks[1]] };
+	const root = planned(project(), plan);
 	cli(root, "execute");
-	assert.throws(() => cli(root, "task-done", "--task", "T2", "--cmd", "exit 0"), /의존 작업이 아직 끝나지 않았습니다. 지금 할 수 있는 작업: T1/);
-	const fail1 = cli(root, "task-done", "--task", "T1", "--cmd", "exit 1");
+	assert.throws(() => cli(root, "task-done", "--task", "T2"), /의존 작업이 아직 끝나지 않았습니다. 지금 할 수 있는 작업: T1/);
+	assert.throws(() => cli(root, "task-done", "--task", "T1", "--cmd", "exit 0"), /--cmd를 받지 않습니다/);
+	const fail1 = cli(root, "task-done", "--task", "T1"); // 아직 구현 전: 테스트가 실패한다
 	assert.equal(fail1.passed, false);
 	assert.equal(fail1.attempts_left, 2);
-	const ok = cli(root, "task-done", "--task", "T1", "--cmd", "echo pass");
+	fs.writeFileSync(path.join(root, "t1.ok"), ""); // 구현
+	const ok = cli(root, "task-done", "--task", "T1");
 	assert.equal(ok.passed, true);
 	assert.equal(ok.task_status, "done");
 	assert.equal(ok.next_task, "T2");
-	assert.throws(() => cli(root, "task-done", "--task", "T1", "--cmd", "exit 0"), /이미 끝난/);
+	assert.throws(() => cli(root, "task-done", "--task", "T1"), /이미 끝난 작업.*reopen/);
 });
 
 test("task-done: 3회 실패하면 전체가 stuck이 되고 끝난·남은 작업을 돌려준다", () => {
-	const root = planned(project());
+	const plan = { ...FULL_PLAN, tasks: [task("T1", { fixed: ["화면:신청폼"], criteria: ["AC-1", "AC-3"] }, { test_cmd: "exit 1" }), FULL_PLAN.tasks[1]] };
+	const root = planned(project(), plan);
 	cli(root, "execute");
 	let r;
-	for (let i = 0; i < 3; i += 1) r = cli(root, "task-done", "--task", "T1", "--cmd", "exit 1");
+	for (let i = 0; i < 3; i += 1) r = cli(root, "task-done", "--task", "T1");
 	assert.equal(r.status, "stuck");
 	assert.match(r.failed_reason, /T1: 3회/);
 	assert.deepEqual(r.remaining, ["T1", "T2"]);
-	assert.throws(() => cli(root, "task-done", "--task", "T1", "--cmd", "exit 0"), /executing/);
+	assert.throws(() => cli(root, "task-done", "--task", "T1"), /executing/);
 });
 
-test("agents 방식: 테스트 통과 뒤 리뷰 pass여야 done, revise는 실패로 센다", () => {
+test("agents 방식: 테스트 통과 뒤 리뷰 pass여야 done, revise는 실패로 센다, 리뷰 대기 작업은 ready에서 빠진다", () => {
 	const root = planned(project(), BIG_PLAN);
 	cli(root, "execute");
 	assert.deepEqual(cli(root, "status").ready_tasks, ["T1", "T3"]); // 독립 작업은 병렬 가능
-	const t = cli(root, "task-done", "--task", "T1", "--cmd", "exit 0");
+	const t = cli(root, "task-done", "--task", "T1");
 	assert.equal(t.task_status, "awaiting_review");
-	assert.throws(() => cli(root, "task-done", "--task", "T2", "--cmd", "exit 0"), /의존 작업이 아직 끝나지 않았습니다/);
-	assert.equal(cli(root, "task-done", "--task", "T3", "--cmd", "exit 0").task_status, "awaiting_review"); // T1 리뷰 전에도 T3는 가능
+	assert.deepEqual(t.ready_tasks, ["T3"]);
+	assert.deepEqual(t.awaiting_review_tasks, ["T1"]);
+	assert.throws(() => cli(root, "task-done", "--task", "T1"), /리뷰 대기 중/);
+	assert.throws(() => cli(root, "task-done", "--task", "T2"), /의존 작업이 아직 끝나지 않았습니다/);
+	assert.equal(cli(root, "task-done", "--task", "T3").task_status, "awaiting_review"); // T1 리뷰 전에도 T3는 가능
 	const rv = cli(root, "task-review", "--task", "T1", "--input", jsonFile(root, "tr.json", { verdict: "revise", findings: [{ target: "T1", finding: "범위 초과" }] }));
 	assert.equal(rv.task_status, "failed");
 	assert.equal(rv.attempts_left, 2);
-	cli(root, "task-done", "--task", "T1", "--cmd", "exit 0");
+	cli(root, "task-done", "--task", "T1");
 	const ok = cli(root, "task-review", "--task", "T1", "--input", jsonFile(root, "tr.json", { verdict: "pass", findings: [] }));
 	assert.equal(ok.task_status, "done");
 	assert.equal(ok.next_task, "T2");
 	assert.throws(() => cli(planned(project()), "task-review", "--task", "T1", "--input", jsonFile(root, "tr.json", { verdict: "pass" })), /executing/);
 });
 
-test("verify: 모든 작업이 끝나야 하고, 완료 기준마다 증거 명령이 0이어야 통과", () => {
-	const root = planned(project());
+test("verify: 모든 작업이 끝나야 하고, 계획의 증거 명령이 전부 0이어야 통과하며, --input은 받지 않는다", () => {
+	const plan = { ...FULL_PLAN, evidence: { ...EVIDENCE, "AC-2": { cmd: "test -f ac2.ok" } } };
+	const root = planned(project(), plan);
 	cli(root, "execute");
-	assert.throws(() => cli(root, "verify", "--input", jsonFile(root, "v.json", { criteria: {} })), /끝나지 않은 작업/);
-	cli(root, "task-done", "--task", "T1", "--cmd", "exit 0");
-	cli(root, "task-done", "--task", "T2", "--cmd", "exit 0");
-	const partial = cli(root, "verify", "--input", jsonFile(root, "v.json", { criteria: { "AC-1": { cmd: "exit 0" }, "AC-2": { cmd: "exit 2" } } }));
+	assert.throws(() => cli(root, "verify"), /끝나지 않은 작업/);
+	cli(root, "task-done", "--task", "T1");
+	cli(root, "task-done", "--task", "T2");
+	assert.throws(() => cli(root, "verify", "--input", "{}"), /--input을 받지 않습니다/);
+	const partial = cli(root, "verify");
 	assert.equal(partial.passed, false);
-	assert.ok(partial.failed.some(f => f.startsWith("AC-2: 종료 코드 2")));
-	assert.ok(partial.failed.some(f => f.startsWith("AC-3: 증거 명령이 없습니다")));
-	assert.throws(() => cli(root, "final-review", "--input", jsonFile(root, "fr.json", { verdict: "pass" })), /verify가 통과한 뒤/);
-	const all = cli(root, "verify", "--input", jsonFile(root, "v.json", { criteria: { "AC-1": { cmd: "exit 0" }, "AC-2": { cmd: "exit 0" }, "AC-3": { cmd: "echo ok" } } }));
-	assert.equal(all.passed, true);
+	assert.ok(partial.failed.some(f => f.startsWith("AC-2: 종료 코드 1")));
+	assert.throws(() => cli(root, "final-review", "--input", jsonFile(root, "fr.json", { verdict: "pass", criteria: OK_CRITERIA })), /verify가 통과한 뒤/);
+	fs.writeFileSync(path.join(root, "ac2.ok"), "");
+	assert.equal(cli(root, "verify").passed, true);
 });
 
-test("final-review: pass면 done, revise면 증거를 무효로 돌리고 3회면 stuck", () => {
-	const finish = root => {
-		cli(root, "execute");
-		cli(root, "task-done", "--task", "T1", "--cmd", "exit 0");
-		cli(root, "task-done", "--task", "T2", "--cmd", "exit 0");
-		cli(root, "verify", "--input", jsonFile(root, "v.json", { criteria: { "AC-1": { cmd: "exit 0" }, "AC-2": { cmd: "exit 0" }, "AC-3": { cmd: "exit 0" } } }));
-		return root;
-	};
-	const done = cli(finish(planned(project())), "final-review", "--input", jsonFile(os.tmpdir(), "fr.json", { verdict: "pass", findings: [] }));
-	assert.equal(done.status, "done");
+test("reopen: 끝난 작업을 다시 열면 증거가 무효가 되고 task-done을 다시 통과해야 한다", () => {
+	const root = finished(planned(project()));
+	assert.throws(() => cli(root, "reopen", "--task", "T9"), /작업 id/);
+	const r = cli(root, "reopen", "--task", "T1");
+	assert.equal(r.task_status, "pending");
+	assert.deepEqual(r.ready_tasks, ["T1"]);
+	assert.throws(() => cli(root, "reopen", "--task", "T1"), /끝난 작업이 아닙니다/);
+	assert.throws(() => cli(root, "verify"), /끝나지 않은 작업이 있습니다: T1/);
+	assert.throws(() => cli(root, "final-review", "--input", jsonFile(root, "fr.json", { verdict: "pass", criteria: OK_CRITERIA })), /verify가 통과한 뒤/);
+	assert.equal(cli(root, "task-done", "--task", "T1").task_status, "done");
+	assert.equal(cli(root, "verify").passed, true);
+});
 
-	const root = finish(planned(project()));
-	const revise = { verdict: "revise", findings: [{ target: "AC-1", finding: "증거가 약함" }] };
+test("final-review: AC별 판정이 모두 있어야 하고, fail이나 blocker가 있으면 pass일 수 없다", () => {
+	const root = finished(planned(project()));
+	const fr = input => cli(root, "final-review", "--input", jsonFile(root, "fr.json", input));
+	assert.throws(() => fr({ verdict: "pass", findings: [] }), /criteria가 필요합니다/);
+	assert.throws(() => fr({ verdict: "pass", criteria: { "AC-1": "ok" }, findings: [] }), /criteria.AC-2/);
+	assert.throws(() => fr({ verdict: "pass", criteria: { ...OK_CRITERIA, "AC-2": "fail" }, findings: [] }), /fail\(AC-2\).*revise/);
+	assert.throws(() => fr({ verdict: "pass", criteria: OK_CRITERIA, findings: [{ target: "AC-1", severity: "blocker", finding: "x" }] }), /blocker.*revise/);
+	const done = fr({ verdict: "pass", criteria: OK_CRITERIA, findings: [{ target: "AC-1", severity: "minor", finding: "이름" }] });
+	assert.equal(done.status, "done");
+	assert.deepEqual(readState(root, SID).execution.final_reviews[0].criteria, OK_CRITERIA);
+});
+
+test("final-review: revise면 지적된 작업을 다시 열고 증거를 무효로 돌리며, 3회면 stuck", () => {
+	const root = finished(planned(project()));
+	const revise = { verdict: "revise", criteria: { ...OK_CRITERIA, "AC-1": "fail" }, findings: [{ target: "T1", severity: "blocker", finding: "DM이 안 감" }] };
 	const r1 = cli(root, "final-review", "--input", jsonFile(root, "fr.json", revise));
 	assert.equal(r1.status, "executing");
+	assert.deepEqual(r1.reopened_tasks, ["T1"]);
+	assert.equal(readState(root, SID).execution.tasks.T1.status, "pending");
 	assert.throws(() => cli(root, "final-review", "--input", jsonFile(root, "fr.json", revise)), /verify가 통과한 뒤/);
-	for (const _ of [2, 3]) {
-		cli(root, "verify", "--input", jsonFile(root, "v.json", { criteria: { "AC-1": { cmd: "exit 0" }, "AC-2": { cmd: "exit 0" }, "AC-3": { cmd: "exit 0" } } }));
-		cli(root, "final-review", "--input", jsonFile(root, "fr.json", revise));
-	}
+	assert.throws(() => cli(root, "verify"), /끝나지 않은 작업이 있습니다: T1/);
+	cli(root, "task-done", "--task", "T1"); // 고친 뒤 다시 통과
+	assert.equal(cli(root, "verify").passed, true);
+	// 작업을 가리키지 않는 지적은 verify부터 다시
+	const r2 = cli(root, "final-review", "--input", jsonFile(root, "fr.json", { ...revise, findings: [{ target: "AC-1", severity: "blocker", finding: "증거가 약함" }] }));
+	assert.deepEqual(r2.reopened_tasks, []);
+	assert.equal(cli(root, "verify").passed, true);
+	cli(root, "final-review", "--input", jsonFile(root, "fr.json", revise));
 	assert.equal(readState(root, SID).status, "stuck");
 });

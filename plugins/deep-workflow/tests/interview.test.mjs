@@ -37,8 +37,43 @@ test("scope: 기록이 있는 덩어리는 지울 수 없고 미루기만 된다
 	const root = tempProject();
 	startWithScope(root);
 	recordRound(root, 1, { g1: "근거" });
+	// 범위를 다시 잡으려면 직전 범위 확정 뒤에 사용자 답이 있어야 한다.
+	const rescope = input({ components: [{ id: "app", name: "앱", status: "deferred" }, { id: "other", name: "다른 것" }] });
+	assert.throws(() => cli(root, "scope", ...rescope), /답한 기록이 없습니다/);
+	say(root, "네, 범위를 바꿔요");
 	assert.throws(() => cli(root, "scope", ...input({ components: [{ id: "other", name: "다른 것" }] })), /지울 수 없습니다/);
-	cli(root, "scope", ...input({ components: [{ id: "app", name: "앱", status: "deferred" }, { id: "other", name: "다른 것" }] }));
+	assert.throws(() => cli(root, "scope", ...input({ components: [{ id: "app", name: "앱", status: "deferred" }] })), /active.*하나 이상/);
+	cli(root, "scope", ...rescope);
+});
+
+test("record: 점수는 이번 라운드를 넣은 뒤 계산한다 (AI 대리 답 비율이 바로 반영됨)", () => {
+	const root = tempProject();
+	startWithScope(root);
+	const r = recordRound(root, 1, allYes(CORE_IDS), { answer_source: "auto" });
+	assert.equal(r.floor, 0.05); // 1라운드 중 1라운드가 AI 대리 답 → 5%p
+	assert.equal(r.ambiguity, 0.05);
+	assert.equal(cli(root, "status").state.rounds[0].floor, 0.05);
+});
+
+test("record: 같은 값이면 처음 찍은 라운드를 유지해서, 나중 라운드를 번복해도 앞 라운드의 체크는 남는다", () => {
+	const root = tempProject();
+	startWithScope(root);
+	recordRound(root, 1, { g1: "근거" });
+	recordRound(root, 2, { g1: "근거", g2: "근거2" });
+	recordRound(root, 2, { g2: false }, { answer: "아니요, 다릅니다" }); // 2라운드 번복
+	const checks = cli(root, "status").state.checks.app;
+	assert.equal(checks.g1?.yes, true); // 1라운드에서 확정한 것은 남는다
+	assert.equal(checks.g2?.yes, false);
+});
+
+test("record: 번복한 라운드에서 같은 id로 다시 보낸 사실은 다시 확정된다", () => {
+	const root = tempProject();
+	startWithScope(root);
+	recordRound(root, 1, allYes(CORE_IDS), { facts: [{ id: "f1", statement: "직원만 신청" }] });
+	const r = recordRound(root, 1, allYes(CORE_IDS), { answer: "다른 답", facts: [{ id: "f1", statement: "직원과 팀장이 신청" }] });
+	assert.equal(r.retracted, true);
+	assert.equal(cli(root, "status").state.facts[0].status, "active");
+	assert.equal(r.floor, 0); // 다시 확정됐으니 뒤집힌 사실 최저선은 없다
 });
 
 test("record: 범위 확정 전에는 거부한다", () => {
@@ -162,13 +197,14 @@ test("잘못된 --type이면 기존 기록을 건드리지 않는다", () => {
 	assert.equal(readState(root, SID).topic, "첫번째");
 });
 
-test("start는 .deep-interview/.gitignore에 sessions/를 넣는다 (한 번만)", () => {
+test("start는 .deep-interview/.gitignore에 sessions/와 builds/를 넣는다 (한 번만)", () => {
 	const root = tempProject();
 	cli(root, "start");
 	cli(root, "end", "--status", "cancelled");
 	cli(root, "start");
 	const ignore = fs.readFileSync(path.join(root, ".deep-interview/.gitignore"), "utf8");
 	assert.equal(ignore.split("\n").filter(line => line === "sessions/").length, 1);
+	assert.equal(ignore.split("\n").filter(line => line === "builds/").length, 1);
 });
 
 test("상위 폴더에 .deep-interview가 있어도 git 최상위 폴더를 쓴다", () => {

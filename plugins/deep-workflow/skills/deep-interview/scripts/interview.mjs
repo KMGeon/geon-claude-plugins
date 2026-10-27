@@ -136,16 +136,18 @@ function scoreTable(state) {
 }
 
 /**
- * `.deep-interview/.gitignore`에 `sessions/`를 넣는다. 상태와 사용자 답 원문이 실수로 커밋되지 않게 하기 위해서다.
- * 스펙(`specs/`)은 남겨서 커밋할 수 있게 둔다. 이미 파일이 있으면 `sessions/` 줄만 없을 때 덧붙인다.
+ * `.deep-interview/.gitignore`에 `sessions/`와 `builds/`를 넣는다. 상태, 사용자 답 원문, 테스트 출력이 실수로 커밋되지 않게 하기 위해서다.
+ * 스펙(`specs/`)·설계·계획은 남겨서 커밋할 수 있게 둔다. 이미 파일이 있으면 없는 줄만 덧붙인다.
  */
 function ensureGitignore(root) {
 	const file = path.join(root, DIR_NAME, ".gitignore");
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	const current = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-	if (current.split("\n").some(line => line.trim() === "sessions/")) return;
+	const have = new Set(current.split("\n").map(line => line.trim()));
+	const missing = ["sessions/", "builds/"].filter(line => !have.has(line));
+	if (missing.length === 0) return;
 	const prefix = current && !current.endsWith("\n") ? "\n" : "";
-	fs.writeFileSync(file, `${current}${prefix}# 딥 인터뷰 상태와 사용자 답 원문 (커밋하지 않음)\nsessions/\n`);
+	fs.writeFileSync(file, `${current}${prefix}# 딥 인터뷰 상태, 사용자 답 원문, 빌드 상태 (커밋하지 않음)\n${missing.join("\n")}\n`);
 }
 
 // =============================================================================
@@ -200,12 +202,15 @@ function cmdStart(root, sid, flags) {
 	};
 }
 
-/** Round 0 결과(덩어리, 고정 항목)를 저장한다. 사용자가 시작 이후 한 번은 답해야 한다. */
+/** Round 0 결과(덩어리, 고정 항목)를 저장한다. 처음이든 다시 잡든, 직전 범위 확정 뒤에 사용자가 한 번은 답해야 한다. */
 function cmdScope(root, sid, flags) {
 	const state = requireActive(root, sid);
 	const input = readInput(flags);
-	// 시작할 때보다 사용자 답이 늘었는지 개수로 본다 (같은 순간에 기록돼도 정확함).
-	if (!(readAnswers(root, sid).length > (state.answers_at_start ?? 0))) fail("사용자가 범위 확인에 답한 기록이 없습니다. 덩어리 목록을 보여주고 사용자 답을 받은 뒤 다시 실행하세요");
+	// 답 개수로 본다 (같은 순간에 기록돼도 정확함). 다시 잡을 때는 직전 scope 이후의 답이어야 한다.
+	const answersNow = readAnswers(root, sid).length;
+	if (!(answersNow > (state.answers_at_scope ?? state.answers_at_start ?? 0))) {
+		fail("사용자가 범위 확인에 답한 기록이 없습니다. 덩어리 목록을 보여주고 사용자 답을 받은 뒤 다시 실행하세요");
+	}
 
 	if (!Array.isArray(input.components) || input.components.length === 0) fail("components에 덩어리가 하나 이상 있어야 합니다");
 	const ids = new Set();
@@ -236,9 +241,11 @@ function cmdScope(root, sid, flags) {
 	if (state.scope_confirmed_at) {
 		state.scope_history.push({ at: new Date().toISOString(), components: state.components, fixed_items: state.fixed_items });
 	}
+	if (!components.some(component => component.status === "active")) fail("진행 중(active)인 덩어리가 하나 이상 있어야 합니다. 전부 미루면 물을 것이 없습니다");
 	state.components = components;
 	state.fixed_items = fixedItems;
 	state.scope_confirmed_at = new Date().toISOString();
+	state.answers_at_scope = answersNow;
 	const evaluation = evaluateState(state);
 	state.current_ambiguity = evaluation.ambiguity;
 	writeState(root, sid, state);
@@ -259,7 +266,11 @@ function applyChecks(state, checks, roundNumber) {
 			if (!dimensions.has(dimension)) fail(`${checkId}는 이 인터뷰(${state.type})에서 쓰지 않는 항목입니다`);
 			if (value !== false && !isText(value)) fail(`${componentId}.${checkId}: "예"는 근거 문자열, "아니오"는 false로 적으세요`);
 			state.checks[componentId] ??= {};
-			state.checks[componentId][checkId] = value === false ? { yes: false, round: roundNumber } : { yes: true, evidence: value, round: roundNumber };
+			const next = value === false ? { yes: false, round: roundNumber } : { yes: true, evidence: value, round: roundNumber };
+			// 값이 그대로면 처음 찍은 라운드를 유지한다. 나중 라운드를 번복할 때 앞 라운드에서 확정한 체크까지 지워지지 않게.
+			const prev = state.checks[componentId][checkId];
+			if (prev && prev.yes === next.yes && (prev.evidence ?? null) === (next.evidence ?? null)) continue;
+			state.checks[componentId][checkId] = next;
 		}
 	}
 }
@@ -270,8 +281,11 @@ function applyFacts(state, input, roundNumber) {
 	for (const fact of input.facts ?? []) {
 		if (!isText(fact?.id) || !isText(fact?.statement)) fail("facts의 항목마다 id와 statement가 필요합니다");
 		const existing = byId(fact.id);
-		if (existing) Object.assign(existing, { statement: fact.statement, evidence: fact.evidence ?? existing.evidence });
-		else state.facts.push({ id: fact.id, statement: fact.statement, evidence: fact.evidence ?? null, round: roundNumber, status: "active", superseded_by: null });
+		if (existing) {
+			Object.assign(existing, { statement: fact.statement, evidence: fact.evidence ?? existing.evidence });
+			// 번복한 라운드에서 같은 id로 다시 보낸 사실은 새 답으로 다시 확정된 것이다.
+			if (existing.round === roundNumber && existing.status === "disputed") existing.status = "active";
+		} else state.facts.push({ id: fact.id, statement: fact.statement, evidence: fact.evidence ?? null, round: roundNumber, status: "active", superseded_by: null });
 	}
 	for (const id of input.dispute ?? []) {
 		const fact = byId(id) ?? fail(`없는 사실입니다: ${id}`);
@@ -326,7 +340,6 @@ function cmdRecord(root, sid, flags) {
 	applyChecks(state, input.checks, roundNumber);
 	applyFacts(state, input, roundNumber);
 
-	const evaluation = evaluateState(state);
 	const record = {
 		round: roundNumber,
 		component: input.component,
@@ -338,15 +351,16 @@ function cmdRecord(root, sid, flags) {
 		checks: input.checks,
 		events: input.events ?? [],
 		notes: input.notes ?? null,
-		ambiguity_raw: evaluation.raw,
-		floor: evaluation.floor,
-		ambiguity: evaluation.ambiguity,
 		recorded_at: new Date().toISOString(),
 		// 이 라운드를 기록할 때까지 쌓인 사용자 답 수. 마무리 확인 답이 그 뒤에 왔는지 셀 때 쓴다.
 		answers_seen: readAnswers(root, sid).length,
 	};
 	if (previous) state.rounds[state.rounds.indexOf(previous)] = record;
 	else state.rounds.push(record);
+
+	// 이 라운드를 넣은 뒤에 계산한다. AI 대리 답 비율(최저선)에 이번 라운드가 바로 반영되게 하기 위해서다.
+	const evaluation = evaluateState(state);
+	Object.assign(record, { ambiguity_raw: evaluation.raw, floor: evaluation.floor, ambiguity: evaluation.ambiguity });
 
 	state.current_ambiguity = evaluation.ambiguity;
 	state.milestone = milestoneFor(evaluation.ambiguity, state.threshold);

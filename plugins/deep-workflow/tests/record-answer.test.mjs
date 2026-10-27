@@ -32,6 +32,14 @@ test("선택지 창 답은 질문, 선택지, 고른 답을 기록한다", () =>
 	assert.deepEqual(Object.values(line.answers), ["맞아요"]);
 });
 
+test("선택지 창에서 고른 답이 없으면(빈 응답) 기록하지 않는다", () => {
+	const root = tempProject();
+	cli(root, "start");
+	const empty = record({ hook_event_name: "PostToolUse", tool_name: "AskUserQuestion", session_id: SID, cwd: root, tool_input: { questions: [] }, tool_response: {} });
+	assert.equal(empty, false);
+	assert.equal(readAnswers(root, SID).length, 0);
+});
+
 test("다른 세션의 메시지는 기록하지 않는다", () => {
 	const root = tempProject();
 	cli(root, "start");

@@ -226,14 +226,14 @@ function componentAmbiguities(state) {
 /**
  * 최저선: 점수를 후하게 주지 않도록, 코드가 상태만 보고 셀 수 있는 최소 모호도.
  * - 뒤집힌 채 정리되지 않은 사실 1개당 +0.10
- * - 목표·제약·성공 기준 중 체크를 한 번도 답하지 않은 항목이 있는 덩어리 1개당 +0.05
+ * - 이 인터뷰의 항목(목표·제약·성공 기준, brownfield면 기존 코드까지) 중 체크를 한 번도 답하지 않은 항목이 있는 덩어리 1개당 +0.05
  * - +0.05 × (AI가 대신 답한 라운드 수 / 기록된 라운드 수)
  */
 export function computeFloor(state) {
 	const disputed = (state.facts ?? []).filter(fact => fact.status === "disputed");
 	const unscored = activeComponents(state).filter(component => {
 		const scores = componentScores(state.checks?.[component.id], state.type);
-		return ["goal", "constraints", "criteria"].some(dimension => scores[dimension] === null);
+		return dimensionsFor(state.type).some(dimension => scores[dimension] === null);
 	});
 	const rounds = (state.rounds ?? []).length;
 	const autoRatio = rounds === 0 ? 0 : (state.rounds ?? []).filter(round => round.answer_source === "auto").length / rounds;

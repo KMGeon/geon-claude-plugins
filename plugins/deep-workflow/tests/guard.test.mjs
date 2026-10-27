@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { CORE_IDS, SID, allYes, cli, recordRound, say, startWithScope, tempProject } from "./helpers.mjs";
 import { evaluate } from "../hooks/guard.mjs";
+import { run } from "../skills/deep-interview/scripts/interview.mjs";
 
 /** 가드 훅에 도구 호출 하나를 넣어 판정 결과를 받는다 (null = 허용). */
 const call = (root, tool_name, tool_input, session_id = SID) => evaluate({ session_id, cwd: root, tool_name, tool_input });
@@ -43,6 +45,19 @@ test("상태 폴더는 언제나 직접 고칠 수 없다", () => {
 	const state = path.join(root, ".deep-interview/sessions", SID, "state.json");
 	assert.match(call(root, "Write", { file_path: state }), /직접 고칠 수 없습니다/);
 	assert.match(call(root, "Edit", { file_path: state }, "other-session"), /직접 고칠 수 없습니다/);
+	// 프로젝트 루트를 못 찾거나 세션 ID가 없어도 경로만 보고 막는다.
+	assert.match(evaluate({ cwd: "/tmp", tool_name: "Write", tool_input: { file_path: "/tmp/no-root/.deep-interview/sessions/s1/state.json" } }), /직접 고칠 수 없습니다/);
+});
+
+test("훅은 인터뷰 CLI와 같은 루트(git 최상위)를 본다: 하위 폴더에 다른 .deep-interview가 있어도", () => {
+	const root = tempProject();
+	execFileSync("git", ["init", "-q"], { cwd: root });
+	const sub = path.join(root, "packages/app");
+	fs.mkdirSync(path.join(sub, ".deep-interview"), { recursive: true });
+	run(["start", "--session", SID], sub); // CLI는 git 최상위(root)에 상태를 쓴다
+	assert.ok(fs.existsSync(path.join(root, ".deep-interview/sessions", SID, "state.json")));
+	assert.match(evaluate({ session_id: SID, cwd: sub, tool_name: "Write", tool_input: { file_path: path.join(sub, "src/a.ts") } }), /딥 인터뷰 진행 중/);
+	assert.equal(say(sub, "맞아요"), true);
 });
 
 test("프로젝트 밖 임시 폴더는 허용하고, 프로젝트 안은 막는다", () => {

@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkBashCommand } from "./bash-check.mjs";
-import { completionBlocker, findRoot, isActive, readState, sessionsDir, specsDir } from "../skills/deep-interview/scripts/state.mjs";
+import { completionBlocker, isActive, projectRoot, readState, specsDir } from "../skills/deep-interview/scripts/state.mjs";
 
 // 파일을 직접 쓰는 도구.
 const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
@@ -22,8 +22,12 @@ const HOOKS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const INTERVIEW_SCRIPT = path.join(HOOKS_DIR, "../skills/deep-interview/scripts/interview.mjs");
 const BUILD_SCRIPT = path.join(HOOKS_DIR, "../skills/deep-build/scripts/build.mjs");
 
-// build.mjs로만 쓸 수 있는 .deep-interview 하위 폴더.
-const BUILD_PROTECTED = new Set(["plans", "builds"]);
+// 상태 명령으로만 쓸 수 있는 .deep-interview 하위 폴더와, 막을 때 안내할 스크립트.
+const PROTECTED = {
+	sessions: `.deep-interview/sessions/는 직접 고칠 수 없습니다. 상태는 node "${INTERVIEW_SCRIPT}" 명령으로만 바꾸세요.`,
+	plans: `.deep-interview/plans/는 직접 쓸 수 없습니다. 계획은 node "${BUILD_SCRIPT}" plan --input으로 등록하세요 (고정 항목·완료 기준 연결을 검사합니다).`,
+	builds: `.deep-interview/builds/는 직접 쓸 수 없습니다. 빌드 상태는 node "${BUILD_SCRIPT}" 명령으로만 바꾸세요.`,
+};
 
 /** 심볼릭 링크를 풀어 실제 경로를 얻는다 (macOS의 /tmp → /private/tmp 등). 없는 경로면 가능한 데까지 푼다. */
 function realish(p) {
@@ -56,11 +60,11 @@ function blockedMessage(reason, sessionId) {
 	].join(" ");
 }
 
-/** 경로가 `.deep-interview/plans/` 또는 `.deep-interview/builds/` 아래면 그 폴더 이름, 아니면 null. */
-function buildProtectedDir(abs) {
+/** 경로가 `.deep-interview/<보호 폴더>/` 아래면 그 폴더 이름, 아니면 null. 경로만 보므로 프로젝트 루트나 세션이 없어도 판정한다. */
+function protectedDir(abs) {
 	const parts = abs.split(path.sep);
 	const at = parts.lastIndexOf(".deep-interview");
-	return at >= 0 && BUILD_PROTECTED.has(parts[at + 1]) ? parts[at + 1] : null;
+	return at >= 0 && parts[at + 1] in PROTECTED ? parts[at + 1] : null;
 }
 
 /** 도구 호출을 판정한다. 막아야 하면 이유 문자열, 허용하면 null. */
@@ -74,20 +78,14 @@ export function evaluate(input) {
 	if (FILE_TOOLS.has(tool)) {
 		const target = toolInput.file_path ?? toolInput.notebook_path;
 		if (typeof target === "string") abs = realish(path.resolve(cwd, target));
-		// 계획과 빌드 상태는 손으로 쓸 수 없다 (어느 세션이든, 프로젝트 루트를 못 찾아도).
-		const dir = abs && buildProtectedDir(abs);
-		if (dir) {
-			return `.deep-interview/${dir}/는 직접 쓸 수 없습니다. 계획은 node "${BUILD_SCRIPT}" plan --input으로 등록하세요 (고정 항목·완료 기준 연결을 검사합니다).`;
-		}
+		// 인터뷰 상태, 계획, 빌드 상태는 손으로 쓸 수 없다 (어느 세션이든, 인터뷰 중이 아니어도).
+		const dir = abs && protectedDir(abs);
+		if (dir) return PROTECTED[dir];
 	}
 
-	const root = findRoot(cwd);
-	if (!root || typeof sessionId !== "string") return null;
-
-	// 상태 파일과 답 기록은 손으로 고칠 수 없다 (어느 세션이든, 인터뷰 중이 아니어도).
-	if (abs && isInside(abs, realish(sessionsDir(root)))) {
-		return `.deep-interview/sessions/는 직접 고칠 수 없습니다. 상태는 node "${INTERVIEW_SCRIPT}" 명령으로만 바꾸세요.`;
-	}
+	if (typeof sessionId !== "string") return null;
+	// 인터뷰 CLI와 같은 규칙으로 루트를 정한다 (git 최상위 우선). 다르게 정하면 CLI가 쓴 상태를 훅이 못 본다.
+	const root = projectRoot(cwd);
 
 	// 이 세션의 인터뷰만 본다. 다른 세션의 인터뷰는 이 세션을 막지 않는다.
 	let state = null;

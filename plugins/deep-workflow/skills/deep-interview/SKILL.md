@@ -153,7 +153,8 @@ Round {n} | {덩어리} | {항목} | 모호도: {현재}%
 | | x3 | 변경이 다른 기능에 주는 영향을 확인했다 |
 
 - **"예"는 대화나 코드에 근거가 있을 때만.** 근거는 사용자 말이나 파일 경로를 짧게 적는다. 추측이면 false다.
-- 이번에 물은 덩어리는 이번 답을 반영해 **모든 체크를 다시** 답한다. 다른 덩어리도 답 때문에 바뀌었으면 함께 보낸다. 보내지 않은 체크는 이전 값이 유지된다.
+- **아직 한 번도 묻지 않은 항목의 체크는 보내지 않는다.** 안 보낸 체크는 "답 없음"(null)으로 남고, 코드가 그 덩어리에 최저선 +5%p를 붙이고 다음 질문 우선순위에 올린다. 미리 `false`로 보내면 "물어봤는데 아니오"로 세어져서 그 장치가 꺼진다.
+- 이번에 물은 항목(`dimension`)의 체크는 이번 답을 반영해 **모두** 답한다. 이번 답 때문에 다른 항목·덩어리의 체크가 바뀌었으면 그것도 함께 보낸다. 보내지 않은 체크는 이전 값이 유지된다.
 - 답이 앞서 확정한 내용과 어긋나거나, 질문을 비켜 갔거나, 범위를 늘렸으면 해당 체크를 false로 되돌리고 `events`에 적는다.
 
 #### 기록
@@ -161,8 +162,10 @@ Round {n} | {덩어리} | {항목} | 모호도: {현재}%
 사용자 답을 받으면 바로 `record`를 실행한다.
 
 ```
-IV record --input '{"round":1,"component":"apply","dimension":"goal","question":"<질문>","answer":"<답 또는 정리본>","answer_source":"user","reason":"<왜 물었나>","checks":{"apply":{"g0":false,"g1":"직원이 웹에서 연차를 신청 (R1 답)","g2":"직원 본인만 (R1 답)","g3":false,"c1":false,"c2":false,"c3":false,"s1":false,"s2":false,"s3":false}},"facts":[{"id":"f1","statement":"신청은 직원 본인만","evidence":"R1 답"}],"events":[],"notes":"<세 관점 점검 메모 등>"}'
+IV record --input '{"round":1,"component":"apply","dimension":"goal","question":"<질문>","answer":"<답 또는 정리본>","answer_source":"user","reason":"<왜 물었나>","checks":{"apply":{"g0":false,"g1":"직원이 웹에서 연차를 신청 (R1 답)","g2":"직원 본인만 (R1 답)","g3":false}},"facts":[{"id":"f1","statement":"신청은 직원 본인만","evidence":"R1 답"}],"events":[],"notes":"<세 관점 점검 메모 등>"}'
 ```
+
+위 예시는 목표(goal)만 물은 1라운드라 `g0~g3`만 보낸다. 제약·성공 기준은 아직 안 물었으니 보내지 않는다.
 
 | 필드 | 뜻 |
 |:---|:---|
@@ -222,13 +225,14 @@ IV record --input '{"round":1,"component":"apply","dimension":"goal","question":
 
 **한 문장으로 맞춰 보기.** 덩어리별 결정을 표로 보여주고, 전체를 한 문장으로 요약한다. AskUserQuestion으로 "이 문장대로 만들면 원하시는 결과가 나올까요?"를 묻는다. 선택지: `네, 이대로`, `표현 고치기`, `빠진 게 있음`. 고칠 게 있으면 반영해서 새 라운드로 기록하고 다시 묻는다. 두 번 해도 안 맞으면 질문 루프로 돌아간다.
 
-### 5. 스펙 저장 후 멈춤
+### 5. 스펙 저장과 인터뷰 종료
 
 `네, 이대로`를 받으면:
 
 1. `IV status`로 전체 기록(라운드, 체크 근거, 사실, 덩어리)을 읽는다.
-2. Write 도구로 `.deep-interview/specs/deep-interview-{주제}.md`를 쓴다. `{주제}`는 짧은 영어 소문자에 하이픈(예: `leave-request`). 고정 항목 ID가 모두 들어가야 한다. 훅이 저장 조건을 검사하고, 안 맞으면 이유와 함께 막는다. 그 이유를 해결한다.
-3. `IV end --spec .deep-interview/specs/deep-interview-{주제}.md`로 인터뷰를 끝낸다. 차단이 풀린다.
+2. Write 도구로 `.deep-interview/specs/deep-interview-{주제}.md`를 쓴다. `{주제}`는 짧은 영어 소문자에 하이픈(예: `leave-request`). 훅은 저장 조건(기록된 라운드, 기준 통과 또는 조기 종료, 마지막 라운드 뒤 사용자 확인)만 검사하고 본문은 읽지 않는다. 막히면 그 이유를 해결한다.
+3. 고정 항목은 `scope`에서 확정한 ID를 **모두** `- \`ID\` — 설명` 줄로 넣는다. 결과 줄은 `기준 통과`와 `기준 미달로 조기 종료` 중 **하나만** 적는다. deep-build가 인터뷰 기록과 대조해서, 빠진 고정 항목이 있거나 결과 줄이 양식 그대로면 시작을 거부한다.
+4. `IV end --spec .deep-interview/specs/deep-interview-{주제}.md`로 인터뷰를 끝낸다. 차단이 풀린다.
 
 ```markdown
 # {제목} — 딥 인터뷰 스펙
@@ -325,11 +329,11 @@ IV record --input '{"round":1,"component":"apply","dimension":"goal","question":
 
 | 스펙 결과 | 할 일 |
 |:---|:---|
-| 기준 통과 | Skill 도구로 `deep-build`를 부른다. 인자는 스펙 경로. 예: `deep-build .deep-interview/specs/deep-interview-leave-request.md` |
-| 조기 종료 (기준 미달) | 스펙의 "남은 질문"과 미달 사실을 보여주고 AskUserQuestion으로 "그래도 설계·계획으로 넘어갈까요?"를 **한 번** 묻는다. 선택지: `넘어가기`, `여기서 멈추기`. 넘어가면 `deep-build <경로> --force`, 멈추면 끝 |
+| 기준 통과 | Skill 도구로 deep-build를 부른다. 인자는 스펙 경로. 예: `Skill(skill: "deep-workflow:deep-build", args: ".deep-interview/specs/deep-interview-leave-request.md")`. 스킬 목록에 `deep-workflow:deep-build`가 없고 `deep-build`만 있으면 그 이름으로 |
+| 조기 종료 (기준 미달) | 스펙의 "남은 질문"과 미달 사실을 보여주고 AskUserQuestion으로 "그래도 설계·계획으로 넘어갈까요?"를 **한 번** 묻는다. 선택지: `넘어가기`, `여기서 멈추기`. 넘어가면 인자에 ` --force`를 붙여 부르고, 멈추면 끝 |
 | 취소 (`--status cancelled`) | 스펙이 없으므로 넘기지 않는다 |
 
-`deep-build`는 같은 플러그인(deep-workflow)에 들어 있다. 어떤 이유로든 부를 수 없으면 스펙 경로만 보여주고 멈춘다. 딥 인터뷰는 단독으로도 쓸 수 있어야 한다.
+`deep-build`는 같은 플러그인(deep-workflow)에 들어 있다. 어떤 이유로든 부를 수 없으면 스펙 경로와 `/deep-build <경로>` 명령을 보여주고 멈춘다. 딥 인터뷰는 단독으로도 쓸 수 있어야 한다.
 
 ## 이어하기
 
