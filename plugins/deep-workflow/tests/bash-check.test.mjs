@@ -12,7 +12,7 @@ test("읽기 전용 셸 명령은 통과한다", () => {
 		"sed -n '1,40p' README.md",
 		"find . -name '*.ts' 2>/dev/null | wc -l",
 		"cat package.json | jq .scripts",
-		'node "/Users/a b/plugins/deep-interview/skills/deep-interview/scripts/interview.mjs" end --session s1',
+		'node "/Users/a b/plugins/deep-workflow/skills/deep-interview/scripts/interview.mjs" end --session s1',
 	]) {
 		assert.deepEqual(checkBashCommand(command), { ok: true }, command);
 	}

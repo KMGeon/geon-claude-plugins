@@ -6,15 +6,17 @@ KMGeon의 개인 Claude Code 플러그인 마켓플레이스.
 
 ```
 /plugin marketplace add KMGeon/geon-claude-plugins
-/plugin install deep-interview@geon-claude-plugins
+/plugin install deep-workflow@geon-claude-plugins
 ```
 
 ## 플러그인
 
-| 이름 | 설명 |
+[deep-workflow](plugins/deep-workflow) 하나에 스킬 두 개가 들어 있습니다. 각각 따로 불러도 되고, 인터뷰가 끝나면 빌드로 자동으로 이어집니다.
+
+| 스킬 | 설명 |
 |:---|:---|
-| [deep-interview](plugins/deep-interview) | 코드 작업 전 요구사항 인터뷰. 한 번에 한 질문, 코드가 계산하는 모호도, 스펙 저장 후 deep-build로 넘김 |
-| [deep-build](plugins/deep-build) | 스펙을 받아 설계 → 계획 → 검토 → 구현 → 완료 판정까지 사람 승인 없이 진행. 계획은 고정 항목·완료 기준이 모두 연결돼야 저장되고, 작업은 코드가 실행한 테스트가 통과해야 끝남 |
+| `/deep-interview` | 코드 작업 전 요구사항 인터뷰. 한 번에 한 질문, 코드가 계산하는 모호도, 스펙 저장 후 deep-build로 넘김 |
+| `/deep-build` | 스펙을 받아 설계 → 계획 → 검토 → 구현 → 완료 판정까지 사람 승인 없이 진행. 계획은 고정 항목·완료 기준이 모두 연결돼야 저장되고, 작업은 코드가 실행한 테스트가 통과해야 끝남 |
 
 ## deep-interview 사용법
 
@@ -59,6 +61,6 @@ KMGeon의 개인 Claude Code 플러그인 마켓플레이스.
 ## 확인
 
 ```
-node --test plugins/*/tests/*.test.mjs
+node --test plugins/deep-workflow/tests/*.test.mjs
 claude plugin validate .
 ```

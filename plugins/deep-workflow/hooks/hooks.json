@@ -1,5 +1,5 @@
 {
-  "description": "deep-interview: 인터뷰 중 코드 수정 차단, 스펙 저장 조건 검사, 사용자 답 원문 기록",
+  "description": "deep-workflow: 인터뷰 중 코드 수정 차단, 스펙 저장 조건 검사, 사용자 답 원문 기록, 계획·빌드 상태 파일 직접 쓰기 차단",
   "hooks": {
     "PreToolUse": [
       {

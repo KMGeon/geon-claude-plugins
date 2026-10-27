@@ -1,0 +1,20 @@
+{
+  "name": "deep-workflow",
+  "version": "0.2.0",
+  "description": "요구사항 인터뷰부터 구현 완료까지 한 흐름. deep-interview: 한 번에 한 질문, 코드가 계산하는 모호도, 기준 아래로 내려오면 스펙 저장. deep-build: 스펙을 받아 설계 → 계획 → 검토 → 구현 → 완료 판정까지 사람 승인 없이 진행.",
+  "author": {
+    "name": "KMGeon"
+  },
+  "repository": "https://github.com/KMGeon/geon-claude-plugins",
+  "license": "MIT",
+  "keywords": [
+    "interview",
+    "requirements",
+    "spec",
+    "brainstorming",
+    "design",
+    "plan",
+    "review",
+    "workflow"
+  ]
+}
