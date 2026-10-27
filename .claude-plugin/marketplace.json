@@ -12,6 +12,12 @@
       "source": "./plugins/deep-interview",
       "description": "코드 작업 전 일대일 요구사항 인터뷰와 모호도 점수",
       "version": "0.1.0"
+    },
+    {
+      "name": "deep-build",
+      "source": "./plugins/deep-build",
+      "description": "딥 인터뷰 스펙을 설계 문서 → 구현 계획 → 검토까지 진행 (1단계)",
+      "version": "0.1.0"
     }
   ]
 }

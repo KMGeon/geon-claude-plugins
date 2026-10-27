@@ -13,7 +13,8 @@ KMGeon의 개인 Claude Code 플러그인 마켓플레이스.
 
 | 이름 | 설명 |
 |:---|:---|
-| [deep-interview](plugins/deep-interview) | 코드 작업 전 요구사항 인터뷰. 한 번에 한 질문, 코드가 계산하는 모호도, 스펙 저장 후 멈춤 |
+| [deep-interview](plugins/deep-interview) | 코드 작업 전 요구사항 인터뷰. 한 번에 한 질문, 코드가 계산하는 모호도, 스펙 저장 후 deep-build로 넘김 |
+| [deep-build](plugins/deep-build) | 스펙을 받아 설계 문서 → 구현 계획 → 검토 에이전트 검토. 계획은 고정 항목·완료 기준이 모두 연결돼야 저장됨 (구현 단계는 예정) |
 
 ## deep-interview 사용법
 
@@ -24,7 +25,20 @@ KMGeon의 개인 Claude Code 플러그인 마켓플레이스.
 1. 기준값을 정하고(기본 20%, `--quick` 35%, `--deep` 5%) 큰 덩어리를 먼저 확정합니다 (Round 0).
 2. 가장 흐릿한 부분을 골라 한 번에 한 질문씩 묻습니다.
 3. 답마다 Claude가 체크리스트(예+근거 / 아니오)에 답하고, **코드가** 모호도와 최저선을 계산해 점수표로 보여줍니다.
-4. 기준 아래로 내려가면 한 번 더 의심하고, 한 문장으로 맞춰 본 뒤 스펙을 `.deep-interview/specs/`에 저장하고 멈춥니다.
+4. 기준 아래로 내려가면 한 번 더 의심하고, 한 문장으로 맞춰 본 뒤 스펙을 `.deep-interview/specs/`에 저장합니다.
+5. 기준을 통과한 스펙은 `deep-build`로 넘어갑니다. 조기 종료 스펙은 한 번 묻습니다.
+
+## deep-build 사용법
+
+```
+/deep-build .deep-interview/specs/deep-interview-<주제>.md
+```
+
+1. 스펙에서 고정 항목 ID와 완료 기준 ID(AC-1…)를 뽑습니다.
+2. 설계 문서를 씁니다. 시퀀스·상태·ERD·API 네 절이 모두 있어야 하고, 해당 없으면 "생략: 이유" 한 줄을 둡니다.
+3. 작업 목록을 만듭니다. 모든 고정 항목과 완료 기준에 담당 작업이 있어야 코드가 계획 파일을 씁니다.
+4. 계획을 쓰지 않은 새 에이전트가 스펙·설계·계획을 대조합니다. 수정은 최대 3회, 넘으면 멈춥니다.
+5. 통과하면 멈춥니다. 구현 단계는 다음에 만듭니다.
 
 ## 코드가 지켜 주는 것
 
@@ -41,6 +55,6 @@ KMGeon의 개인 Claude Code 플러그인 마켓플레이스.
 ## 확인
 
 ```
-node --test plugins/deep-interview/tests/*.test.mjs
+node --test plugins/*/tests/*.test.mjs
 claude plugin validate .
 ```
