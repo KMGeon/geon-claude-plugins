@@ -74,7 +74,7 @@ function deny(reason) {
  * 대신 숨은 명령 실행이 가능한 구문은 바로 거부한다:
  * 명령 치환 `$(...)`·백틱, 프로세스 치환 `<(...)`, heredoc `<<`, `/dev/null` 이외로의 출력 리다이렉트.
  */
-export function tokenize(command) {
+function tokenize(command) {
 	const segments = [];
 	let words = [];
 	let current = "";
@@ -201,7 +201,7 @@ function stripAssignments(words) {
 }
 
 /** `node .../scripts/interview.mjs ...` 형태인지. 인터뷰를 끝내려면 이 스크립트를 실행해야 하므로 항상 허용한다. */
-export function isInterviewScript(words) {
+function isInterviewScript(words) {
 	return words[0] === "node" && typeof words[1] === "string" && /(^|\/)scripts\/interview\.mjs$/.test(words[1]);
 }
 

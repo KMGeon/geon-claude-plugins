@@ -20,10 +20,10 @@ import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 
 export const DIR_NAME = ".deep-interview";
-export const MAX_REVIEW_ROUNDS = 3;
-export const MAX_TASK_ATTEMPTS = 3;
-export const SINGLE_SESSION_MAX_TASKS = 3;
-export const DESIGN_SECTIONS = ["시퀀스", "상태", "ERD", "API"];
+const MAX_REVIEW_ROUNDS = 3;
+const MAX_TASK_ATTEMPTS = 3;
+const SINGLE_SESSION_MAX_TASKS = 3;
+const DESIGN_SECTIONS = ["시퀀스", "상태", "ERD", "API"];
 const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 
 class CliError extends Error {}
@@ -102,9 +102,8 @@ export function projectRoot(cwd = process.cwd()) {
 	}
 }
 
-export const buildsDir = root => path.join(root, DIR_NAME, "builds");
-export const plansDir = root => path.join(root, DIR_NAME, "plans");
-export const designsDir = root => path.join(root, DIR_NAME, "designs");
+const buildsDir = root => path.join(root, DIR_NAME, "builds");
+const plansDir = root => path.join(root, DIR_NAME, "plans");
 export const statePath = (root, sid) => path.join(buildsDir(root), `${assertSessionId(sid)}.json`);
 
 export function readState(root, sid) {
@@ -252,7 +251,7 @@ export function checkPlan(plan, spec) {
 }
 
 /** 계획을 사람이 읽는 markdown으로 만든다. */
-export function renderPlan(plan, spec, meta) {
+function renderPlan(plan, spec, meta) {
 	const lines = [];
 	lines.push(`# ${spec.title} — 구현 계획`, "");
 	lines.push(`- 스펙: ${meta.spec_path}`, `- 설계: ${meta.design_path}`, `- 작업 수: ${plan.tasks.length}`, `- 날짜: ${meta.date}`, "");

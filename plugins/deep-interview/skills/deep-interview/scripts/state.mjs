@@ -30,7 +30,7 @@ export const DIMENSION_NAMES = { goal: "목표", constraints: "제약", criteria
 
 // 채점 체크리스트. AI는 감으로 0~1 점수를 매기지 않고, 질문마다 예(근거 한 줄)/아니오만 답한다.
 // 항목 점수 = 예의 개수 / 질문 수. 같은 답이면 언제나 같은 점수가 나온다.
-export const CHECKLIST = {
+const CHECKLIST = {
 	goal: {
 		// "왜"를 맨 앞에 둔다. 이유를 모르면 요구사항을 잘 정리해도 엉뚱한 문제를 풀 수 있다.
 		g0: "왜 만드는지(해결할 문제와 그 이유)가 정해졌다",
@@ -184,7 +184,7 @@ export function componentScores(checks, type) {
 }
 
 /** 진행 중인(미루지 않은) 덩어리 목록. */
-export function activeComponents(state) {
+function activeComponents(state) {
 	return (state.components ?? []).filter(component => component.status !== "deferred");
 }
 
@@ -217,7 +217,7 @@ export function rawAmbiguity(state) {
 }
 
 /** 덩어리마다 따로 계산한 모호도. 마무리하려면 모든 덩어리가 기준 이하여야 한다. */
-export function componentAmbiguities(state) {
+function componentAmbiguities(state) {
 	return Object.fromEntries(
 		activeComponents(state).map(component => [component.id, ambiguityOf(componentScores(state.checks?.[component.id], state.type), state.type)]),
 	);

@@ -35,7 +35,7 @@ function isInside(child, parent) {
 }
 
 /** 임시 폴더 안의 파일인지. 스펙 초안 같은 메모를 임시 폴더에 쓰는 것은 허용한다. */
-export function isTempPath(file) {
+function isTempPath(file) {
 	const roots = ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", os.tmpdir()].map(realish);
 	return roots.some(root => isInside(realish(file), root));
 }

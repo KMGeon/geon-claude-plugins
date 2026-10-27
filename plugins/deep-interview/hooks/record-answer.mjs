@@ -11,7 +11,7 @@ import { appendAnswer, findRoot, isActive, readState } from "../skills/deep-inte
 const isObject = value => Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
 /** 훅 입력을 기록 한 줄로 바꾼다. 기록할 게 아니면 null. */
-export function buildRecord(input, now = new Date()) {
+function buildRecord(input, now = new Date()) {
 	if (input?.hook_event_name === "UserPromptSubmit" || typeof input?.prompt === "string") {
 		if (typeof input.prompt !== "string" || !input.prompt.trim()) return null;
 		return { ts: now.toISOString(), source: "chat", text: input.prompt };
