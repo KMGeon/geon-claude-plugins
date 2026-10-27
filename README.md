@@ -7,6 +7,7 @@ KMGeon의 개인 Claude Code 플러그인 마켓플레이스.
 ```
 /plugin marketplace add KMGeon/geon-claude-plugins
 /plugin install deep-workflow@geon-claude-plugins
+/plugin install mem0-self@geon-claude-plugins
 ```
 
 ## 플러그인
@@ -61,6 +62,10 @@ KMGeon의 개인 Claude Code 플러그인 마켓플레이스.
 상태 파일(`.deep-interview/sessions/`, `plans/`, `builds/`)은 직접 고칠 수 없고 상태 명령으로만 바뀝니다. 셸 명령으로 우회하는 것까지 막지는 않습니다(받아들인 위험).
 기록은 `.deep-interview/sessions/<세션>/`(상태, 답 원문)에, 결과는 `.deep-interview/specs/`에 남습니다.
 설계 근거(이 플러그인을 딥 인터뷰로 설계한 기록)는 [docs/design-record.md](docs/design-record.md)에 있습니다.
+
+## mem0-self
+
+[mem0-self](plugins/mem0-self)는 Mem0 공식 Claude Code 플러그인을 self-host Mem0 서버용으로 포크한 것입니다. 설치 설정과 공식 플러그인과 다른 점은 플러그인 README에 있습니다.
 
 ## 확인
 

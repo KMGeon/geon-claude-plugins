@@ -1,0 +1,63 @@
+{
+  "name": "mem0-self",
+  "version": "0.1.0",
+  "description": "Mem0 공식 Claude Code 플러그인 0.3.3을 self-host Mem0 서버(/memories, /search, X-API-Key)용으로 포크한 버전. 세션 기록을 모아 self-host 서버에 기억으로 저장하고, 다음 세션에서 다시 불러온다.",
+  "author": {
+    "name": "KMGeon"
+  },
+  "homepage": "https://github.com/KMGeon/geon-claude-plugins/tree/main/plugins/mem0-self",
+  "repository": "https://github.com/KMGeon/geon-claude-plugins",
+  "license": "Apache-2.0",
+  "keywords": [
+    "memory",
+    "coding-agents",
+    "continual-learning",
+    "token-efficiency"
+  ],
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "Mem0 API Key",
+      "description": "Self-host Mem0 서버의 ADMIN_API_KEY (X-API-Key 헤더).",
+      "sensitive": true,
+      "required": true
+    },
+    "user_id": {
+      "type": "string",
+      "title": "Memory user ID",
+      "description": "Optional stable ID shared across machines. When omitted, Mem0 uses your local account name, matching the earlier Mem0 Claude Code plugin.",
+      "required": true
+    },
+    "top_k": {
+      "type": "number",
+      "title": "Manual search results",
+      "description": "Maximum number of memories returned when Claude runs another search after the automatic first search.",
+      "default": 3,
+      "min": 1,
+      "max": 20,
+      "required": false
+    },
+    "max_context_chars": {
+      "type": "number",
+      "title": "Maximum retrieved context",
+      "description": "Maximum number of memory characters returned for one search.",
+      "default": 4000,
+      "min": 1000,
+      "max": 10000,
+      "required": false
+    },
+    "search_scope": {
+      "type": "string",
+      "title": "Default search scope",
+      "description": "How wide every search runs by default. 'repo' is the whole repository's shared memory plus your own preferences, 'dir' narrows the shared memory to the directory you are working in, and 'mine' is your preferences alone.",
+      "default": "repo",
+      "required": false
+    },
+    "api_url": {
+      "type": "string",
+      "title": "Mem0 self-host API URL",
+      "description": "self-host Mem0 서버 주소. 예: http://<서버 IP>:8888",
+      "required": true
+    }
+  }
+}

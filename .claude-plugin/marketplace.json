@@ -12,6 +12,12 @@
       "source": "./plugins/deep-workflow",
       "description": "요구사항 인터뷰(deep-interview) → 설계·계획·구현·완료 판정(deep-build)까지 한 흐름",
       "version": "0.2.0"
+    },
+    {
+      "name": "mem0-self",
+      "source": "./plugins/mem0-self",
+      "description": "Mem0 공식 플러그인을 self-host Mem0 서버용으로 포크. 세션 기록을 self-host 서버에 기억으로 저장하고 다음 세션에서 불러옴",
+      "version": "0.1.0"
     }
   ]
 }
