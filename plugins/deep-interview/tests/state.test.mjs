@@ -12,19 +12,20 @@ function checks(yes, no = []) {
 
 test("항목 점수는 예의 개수 / 질문 수이고, 답이 없으면 null", () => {
 	const scores = componentScores(checks(["g1", "g2"], ["g3", "c1"]), "greenfield");
-	assert.equal(scores.goal, 0.67);
+	// 목표는 질문 4개(g0~g3) 중 예 2개
+	assert.equal(scores.goal, 0.5);
 	assert.equal(scores.constraints, 0);
 	assert.equal(scores.criteria, null);
 	assert.equal("context" in scores, false);
 });
 
 test("새로 만들기: 모호도 = 1 - (목표×0.4 + 제약×0.3 + 성공 기준×0.3)", () => {
-	const state = { type: "greenfield", components: [{ id: "a" }], checks: { a: checks(["g1", "g2", "g3", "c1", "c2", "c3"], ["s1", "s2", "s3"]) } };
+	const state = { type: "greenfield", components: [{ id: "a" }], checks: { a: checks(["g0", "g1", "g2", "g3", "c1", "c2", "c3"], ["s1", "s2", "s3"]) } };
 	assert.equal(rawAmbiguity(state), 0.3);
 });
 
 test("기존 코드 고치기는 기존 코드 항목 15%가 더해진다", () => {
-	const all = ["g1", "g2", "g3", "c1", "c2", "c3", "s1", "s2", "s3"];
+	const all = ["g0", "g1", "g2", "g3", "c1", "c2", "c3", "s1", "s2", "s3"];
 	const state = { type: "brownfield", components: [{ id: "a" }], checks: { a: checks(all, ["x1", "x2", "x3"]) } };
 	assert.equal(rawAmbiguity(state), 0.15);
 });
@@ -33,18 +34,19 @@ test("전체 점수는 진행 중인 덩어리들의 평균 (미룬 덩어리는
 	const state = {
 		type: "greenfield",
 		components: [{ id: "a" }, { id: "b" }, { id: "c", status: "deferred" }],
-		checks: { a: checks(["g1", "g2", "g3"]), b: checks(["g1"], ["g2", "g3"]) },
+		checks: { a: checks(["g0", "g1", "g2", "g3"]), b: checks(["g1"], ["g0", "g2", "g3"]) },
 	};
-	assert.equal(overallScores(state).goal, 0.67);
+	// a는 1, b는 0.25 → 평균 0.625
+	assert.equal(overallScores(state).goal, 0.63);
 });
 
 test("한 덩어리만 다 정해져도 화면 모호도는 내려가지만, 기준 통과는 모든 덩어리가 각각 넘어야 한다", () => {
-	const all = ["g1", "g2", "g3", "c1", "c2", "c3", "s1", "s2", "s3"];
+	const all = ["g0", "g1", "g2", "g3", "c1", "c2", "c3", "s1", "s2", "s3"];
 	const state = { type: "greenfield", threshold: 0.2, components: [{ id: "a" }, { id: "b" }], checks: { a: checks(all), b: checks(all, []) } };
 	assert.equal(evaluateState(state).threshold_met, true);
 
 	// b는 성공 기준이 비어 혼자 30%, 평균은 15%라 화면상으로는 기준(20%) 아래지만 통과가 아니다.
-	state.checks.b = checks(["g1", "g2", "g3", "c1", "c2", "c3"], ["s1", "s2", "s3"]);
+	state.checks.b = checks(["g0", "g1", "g2", "g3", "c1", "c2", "c3"], ["s1", "s2", "s3"]);
 	const result = evaluateState(state);
 	assert.equal(result.ambiguity, 0.15);
 	assert.equal(result.per_component.b, 0.3);
@@ -56,7 +58,7 @@ test("최저선: 뒤집힌 사실 +0.10, 점수 빈 덩어리 +0.05, AI 대리 �
 	const state = {
 		type: "greenfield",
 		components: [{ id: "a" }, { id: "b" }],
-		checks: { a: checks(["g1", "g2", "g3", "c1", "c2", "c3", "s1", "s2", "s3"]) },
+		checks: { a: checks(["g0", "g1", "g2", "g3", "c1", "c2", "c3", "s1", "s2", "s3"]) },
 		facts: [{ id: "f1", status: "disputed" }, { id: "f2", status: "superseded" }],
 		rounds: [{ answer_source: "auto" }, { answer_source: "user" }],
 	};
@@ -66,7 +68,7 @@ test("최저선: 뒤집힌 사실 +0.10, 점수 빈 덩어리 +0.05, AI 대리 �
 });
 
 test("최종 모호도는 계산값과 최저선 중 큰 값", () => {
-	const all = ["g1", "g2", "g3", "c1", "c2", "c3", "s1", "s2", "s3"];
+	const all = ["g0", "g1", "g2", "g3", "c1", "c2", "c3", "s1", "s2", "s3"];
 	const state = { type: "greenfield", components: [{ id: "a" }], checks: { a: checks(all) }, facts: [{ id: "f1", status: "disputed" }] };
 	const result = evaluateState(state);
 	assert.equal(result.raw, 0);
@@ -92,4 +94,11 @@ test("다음 질문 제안: 점수 없는 곳 먼저, 비슷하면 방금 물은
 	assert.equal(next.component, "a");
 	assert.equal(next.dimension, "constraints");
 	assert.equal(next.unmet.length, 3);
+});
+
+test("목표 항목은 '왜'(g0)를 포함하고, 다음 질문 제안에서 맨 앞에 나온다", () => {
+	const state = { type: "greenfield", components: [{ id: "a" }], checks: {}, rounds: [] };
+	const next = suggestNext(state);
+	assert.equal(next.dimension, "goal");
+	assert.match(next.unmet[0], /^g0: 왜 만드는지/);
 });

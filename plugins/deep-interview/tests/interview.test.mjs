@@ -50,7 +50,7 @@ test("record: 범위 확정 전에는 거부한다", () => {
 test("record: 코드가 체크리스트로 모호도를 계산한다", () => {
 	const root = tempProject();
 	startWithScope(root);
-	const result = recordRound(root, 1, { ...allYes(["g1", "g2", "g3", "c1", "c2", "c3"]), s1: false, s2: false, s3: false });
+	const result = recordRound(root, 1, { ...allYes(["g0", "g1", "g2", "g3", "c1", "c2", "c3"]), s1: false, s2: false, s3: false });
 	assert.equal(result.ambiguity_raw, 0.3);
 	assert.equal(result.ambiguity, 0.3);
 	assert.equal(result.milestone, "막바지");

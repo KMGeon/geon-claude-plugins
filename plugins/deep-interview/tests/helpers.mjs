@@ -45,7 +45,7 @@ export function allYes(ids) {
 	return Object.fromEntries(ids.map(id => [id, `${id} 근거`]));
 }
 
-export const CORE_IDS = ["g1", "g2", "g3", "c1", "c2", "c3", "s1", "s2", "s3"];
+export const CORE_IDS = ["g0", "g1", "g2", "g3", "c1", "c2", "c3", "s1", "s2", "s3"];
 
 /** 인터뷰를 시작하고 덩어리 하나(app)로 범위를 확정한다. */
 export function startWithScope(root, { components = [{ id: "app", name: "앱" }], flags = [] } = {}) {
