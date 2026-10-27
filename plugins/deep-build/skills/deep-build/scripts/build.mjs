@@ -7,16 +7,24 @@
 //   design --file <설계 문서 경로>              설계 문서 4종(시퀀스·상태·ERD·API)이 있거나 생략 이유가 있는지 검사하고 등록
 //   plan   --input <JSON 또는 @경로>            작업 목록을 검사(고정 항목·완료 기준 연결)하고 계획 파일을 쓴다
 //   review --input <JSON 또는 @경로>            검토 결과를 기록한다. 통과면 planned, 3회 넘게 수정이면 stuck
+//   execute                                     (2단계) 구현 시작. 작업 수로 방식을 정하고 의존 순서를 돌려준다
+//   task-done --task <id> --cmd "<테스트 명령>"   코드가 테스트 명령을 실행해 종료 코드 0일 때만 작업 완료
+//   task-review --task <id> --input <JSON>      (에이전트 방식) 리뷰 에이전트 판정 기록. revise도 실패로 센다
+//   verify --input <JSON>                       완료 기준(AC)마다 증거 명령을 코드가 실행, 전부 0이어야 통과
+//   final-review --input <JSON>                 새 에이전트의 전체 리뷰. pass면 done
 //   status                                      현재 상태
 // 결과는 JSON. 실패하면 {"ok": false, "error": "..."}와 종료 코드 1.
 
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 
 export const DIR_NAME = ".deep-interview";
 export const MAX_REVIEW_ROUNDS = 3;
+export const MAX_TASK_ATTEMPTS = 3;
+export const SINGLE_SESSION_MAX_TASKS = 3;
 export const DESIGN_SECTIONS = ["시퀀스", "상태", "ERD", "API"];
+const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
 
 class CliError extends Error {}
 const fail = message => {
@@ -399,13 +407,281 @@ function cmdReview(root, sid, flags) {
 	};
 }
 
+// =============================================================================
+// 2단계: 구현 → 완료 판정
+// =============================================================================
+
+/** 의존 관계를 지키는 작업 순서. 순환이 있으면 오류. */
+export function taskOrder(tasks) {
+	const byId = new Map(tasks.map(t => [t.id, t]));
+	const order = [];
+	const seen = new Set();
+	const visiting = new Set();
+	const visit = id => {
+		if (seen.has(id)) return;
+		if (visiting.has(id)) fail(`작업 의존이 순환합니다: ${id}`);
+		visiting.add(id);
+		for (const dep of byId.get(id)?.depends_on ?? []) visit(dep);
+		visiting.delete(id);
+		seen.add(id);
+		order.push(id);
+	};
+	for (const t of tasks) visit(t.id);
+	return order;
+}
+
+/** 지금 할 수 있는 작업들: 아직 안 끝났고 의존 작업이 모두 끝난 작업. 서로 독립이면 여러 개가 나오고, 병렬로 해도 된다. */
+function readyTasks(state) {
+	const done = new Set(Object.entries(state.execution.tasks).filter(([, t]) => t.status === "done").map(([id]) => id));
+	return state.execution.order.filter(id => {
+		if (state.execution.tasks[id].status === "done") return false;
+		const deps = state.plan.tasks.find(x => x.id === id)?.depends_on ?? [];
+		return deps.every(d => done.has(d));
+	});
+}
+
+/** 다음에 할 작업 하나 (순서상 첫 번째). */
+function nextTask(state) {
+	return readyTasks(state)[0] ?? null;
+}
+
+/** 셸 명령을 프로젝트 루트에서 실행하고 결과를 요약한다. 출력은 끝 2000자만 남긴다. */
+export function runCommand(root, cmd) {
+	const started = Date.now();
+	const r = spawnSync(cmd, { shell: true, cwd: root, encoding: "utf8", timeout: COMMAND_TIMEOUT_MS, maxBuffer: 50 * 1024 * 1024 });
+	const out = `${r.stdout ?? ""}${r.stderr ? `\n[stderr]\n${r.stderr}` : ""}`.trim();
+	return {
+		cmd,
+		exit_code: r.status ?? (r.error ? -1 : null),
+		timed_out: Boolean(r.error && r.error.code === "ETIMEDOUT"),
+		duration_ms: Date.now() - started,
+		output_tail: out.length > 2000 ? `…${out.slice(-2000)}` : out,
+	};
+}
+
+function requireExecuting(state) {
+	if (state.status !== "executing") fail(`구현 중(executing) 상태가 아닙니다 (현재: ${state.status})`);
+	return state.execution;
+}
+
+function executionSummary(state) {
+	const ex = state.execution;
+	if (!ex) return {};
+	const list = ex.order.map(id => ({ id, title: state.plan.tasks.find(t => t.id === id)?.title, status: ex.tasks[id].status, attempts: ex.tasks[id].attempts }));
+	return {
+		mode: ex.mode,
+		tasks: list,
+		done: list.filter(t => t.status === "done").map(t => t.id),
+		remaining: list.filter(t => t.status !== "done").map(t => t.id),
+		failed_reason: ex.failed_reason ?? null,
+		next_task: state.status === "executing" ? nextTask(state) : null,
+		ready_tasks: state.status === "executing" ? readyTasks(state) : [],
+	};
+}
+
+/** 구현을 시작한다. 작업 수로 방식을 고른다. */
+function cmdExecute(root, sid, flags) {
+	const state = requireState(root, sid);
+	if (state.status !== "planned") fail(`구현은 검토를 통과한(planned) 뒤에만 시작할 수 있습니다 (현재: ${state.status})`);
+	const tasks = state.plan.tasks;
+	const order = taskOrder(tasks);
+	state.execution = {
+		mode: tasks.length <= SINGLE_SESSION_MAX_TASKS ? "single" : "agents",
+		order,
+		tasks: Object.fromEntries(order.map(id => [id, { status: "pending", attempts: 0, runs: [], reviews: [] }])),
+		criteria_evidence: null,
+		final_reviews: [],
+		started_at: new Date().toISOString(),
+	};
+	state.status = "executing";
+	writeState(root, sid, state);
+	return {
+		ok: true,
+		...summary(state),
+		...executionSummary(state),
+		next:
+			state.execution.mode === "single"
+				? `작업이 ${tasks.length}개라 이 세션이 순서대로 구현합니다. 작업마다 task-done --cmd로 테스트를 실행하세요`
+				: `작업이 ${tasks.length}개라 작업마다 구현 에이전트를 띄우고, task-done 뒤 리뷰 에이전트 판정을 task-review로 기록하세요`,
+	};
+}
+
+/** 작업 실패를 기록하고, 3회면 전체를 멈춘다. */
+function recordFailure(state, id, reason) {
+	const t = state.execution.tasks[id];
+	t.attempts += 1;
+	t.status = "failed";
+	if (t.attempts >= MAX_TASK_ATTEMPTS) {
+		state.status = "stuck";
+		state.execution.failed_reason = `${id}: ${MAX_TASK_ATTEMPTS}회 시도 뒤에도 실패. 마지막 이유: ${reason}`;
+	}
+}
+
+/** 테스트 명령을 코드가 실행해 작업 완료를 판정한다. */
+function cmdTaskDone(root, sid, flags) {
+	const state = requireState(root, sid);
+	const ex = requireExecuting(state);
+	const id = flags.task;
+	if (!isText(id) || !ex.tasks[id]) fail(`--task는 계획의 작업 id여야 합니다: ${id}`);
+	if (ex.tasks[id].status === "done") fail(`${id}는 이미 끝난 작업입니다`);
+	const ready = readyTasks(state);
+	if (!ready.includes(id)) fail(`${id}는 의존 작업이 아직 끝나지 않았습니다. 지금 할 수 있는 작업: ${ready.join(", ") || "없음"}`);
+	if (!isText(flags.cmd)) fail('--cmd "<테스트 명령>"이 필요합니다. 계획의 "먼저 실패할 테스트"를 실행하는 명령입니다');
+
+	const run = runCommand(root, flags.cmd);
+	const t = ex.tasks[id];
+	t.runs.push({ ...run, at: new Date().toISOString() });
+	if (run.exit_code === 0) {
+		t.status = ex.mode === "agents" ? "awaiting_review" : "done";
+	} else {
+		recordFailure(state, id, run.timed_out ? "테스트 시간 초과" : `테스트 종료 코드 ${run.exit_code}`);
+	}
+	writeState(root, sid, state);
+	return {
+		ok: true,
+		task: id,
+		passed: run.exit_code === 0,
+		exit_code: run.exit_code,
+		output_tail: run.output_tail,
+		attempts: t.attempts,
+		attempts_left: Math.max(0, MAX_TASK_ATTEMPTS - t.attempts),
+		status: state.status,
+		task_status: t.status,
+		...executionSummary(state),
+		next:
+			state.status === "stuck"
+				? "전체를 멈춥니다. 끝난 작업·남은 작업·실패 이유를 사용자에게 보여주세요"
+				: t.status === "awaiting_review"
+					? `리뷰 에이전트에게 ${id}의 변경을 검토시키고 task-review로 기록하세요`
+					: t.status === "done"
+						? nextTask(state)
+							? `다음 작업: ${nextTask(state)}`
+							: "모든 작업이 끝났습니다. verify로 완료 기준 증거를 기록하세요"
+						: `${id}를 고치고 다시 task-done을 실행하세요 (남은 시도 ${Math.max(0, MAX_TASK_ATTEMPTS - t.attempts)}회)`,
+	};
+}
+
+/** 에이전트 방식에서 작업 리뷰 판정을 기록한다. */
+function cmdTaskReview(root, sid, flags) {
+	const state = requireState(root, sid);
+	const ex = requireExecuting(state);
+	if (ex.mode !== "agents") fail("task-review는 에이전트 방식(작업 4개 이상)에서만 씁니다");
+	const id = flags.task;
+	if (!isText(id) || !ex.tasks[id]) fail(`--task는 계획의 작업 id여야 합니다: ${id}`);
+	const t = ex.tasks[id];
+	if (t.status !== "awaiting_review") fail(`${id}는 리뷰 대기 상태가 아닙니다 (현재: ${t.status}). 먼저 task-done으로 테스트를 통과시키세요`);
+	const input = readInput(flags);
+	if (!["pass", "revise"].includes(input.verdict)) fail('verdict는 "pass" 또는 "revise"여야 합니다');
+	const findings = Array.isArray(input.findings) ? input.findings : [];
+	if (input.verdict === "revise" && findings.length === 0) fail("revise 판정에는 findings가 하나 이상 있어야 합니다");
+	t.reviews.push({ verdict: input.verdict, findings, summary: input.summary ?? null, at: new Date().toISOString() });
+	if (input.verdict === "pass") t.status = "done";
+	else recordFailure(state, id, `리뷰 revise: ${findings[0]?.finding ?? ""}`);
+	writeState(root, sid, state);
+	return {
+		ok: true,
+		task: id,
+		verdict: input.verdict,
+		status: state.status,
+		task_status: t.status,
+		attempts_left: Math.max(0, MAX_TASK_ATTEMPTS - t.attempts),
+		...executionSummary(state),
+		next:
+			state.status === "stuck"
+				? "전체를 멈춥니다. 끝난 작업·남은 작업·실패 이유를 사용자에게 보여주세요"
+				: t.status === "done"
+					? nextTask(state)
+						? `다음 작업: ${nextTask(state)}`
+						: "모든 작업이 끝났습니다. verify로 완료 기준 증거를 기록하세요"
+					: `${id}의 지적을 고치고 다시 task-done부터 실행하세요`,
+	};
+}
+
+/** 완료 기준마다 증거 명령을 실행한다. 전부 종료 코드 0이어야 통과. */
+function cmdVerify(root, sid, flags) {
+	const state = requireState(root, sid);
+	const ex = requireExecuting(state);
+	if (nextTask(state) !== null || Object.values(ex.tasks).some(t => t.status !== "done")) {
+		fail(`아직 끝나지 않은 작업이 있습니다: ${Object.entries(ex.tasks).filter(([, t]) => t.status !== "done").map(([id]) => id).join(", ")}`);
+	}
+	const input = readInput(flags);
+	const evidence = input.criteria;
+	if (!evidence || typeof evidence !== "object") fail('criteria가 필요합니다: { "AC-1": { "cmd": "<명령>", "note": "..." }, ... }');
+	const results = {};
+	const failed = [];
+	for (const c of state.spec.criteria) {
+		const entry = evidence[c.id];
+		if (!entry || !isText(entry.cmd)) {
+			failed.push(`${c.id}: 증거 명령이 없습니다`);
+			continue;
+		}
+		const run = runCommand(root, entry.cmd);
+		results[c.id] = { ...run, note: entry.note ?? null, text: c.text };
+		if (run.exit_code !== 0) failed.push(`${c.id}: 종료 코드 ${run.exit_code}`);
+	}
+	ex.criteria_evidence = { results, at: new Date().toISOString(), passed: failed.length === 0 };
+	writeState(root, sid, state);
+	if (failed.length) {
+		return { ok: true, passed: false, failed, results, next: "실패한 완료 기준을 고치고 verify를 다시 실행하세요. 작업을 고쳐야 하면 그 작업의 테스트도 다시 통과해야 합니다" };
+	}
+	return { ok: true, passed: true, results, next: "새 리뷰 에이전트에게 전체 변경을 스펙과 대조시키고 final-review로 기록하세요" };
+}
+
+/** 전체 리뷰 판정을 기록한다. pass면 done, 3회 revise면 stuck. */
+function cmdFinalReview(root, sid, flags) {
+	const state = requireState(root, sid);
+	const ex = requireExecuting(state);
+	if (!ex.criteria_evidence?.passed) fail("verify가 통과한 뒤에만 최종 리뷰를 기록할 수 있습니다");
+	const input = readInput(flags);
+	if (!["pass", "revise"].includes(input.verdict)) fail('verdict는 "pass" 또는 "revise"여야 합니다');
+	const findings = Array.isArray(input.findings) ? input.findings : [];
+	if (input.verdict === "revise" && findings.length === 0) fail("revise 판정에는 findings가 하나 이상 있어야 합니다");
+	const round = ex.final_reviews.length + 1;
+	ex.final_reviews.push({ round, verdict: input.verdict, findings, summary: input.summary ?? null, at: new Date().toISOString() });
+	if (input.verdict === "pass") {
+		state.status = "done";
+		state.done_at = new Date().toISOString();
+	} else if (round >= MAX_REVIEW_ROUNDS) {
+		state.status = "stuck";
+		ex.failed_reason = `최종 리뷰 ${MAX_REVIEW_ROUNDS}회 뒤에도 revise`;
+	} else {
+		// 고친 뒤 verify부터 다시 한다. 증거는 무효로 돌린다.
+		ex.criteria_evidence = null;
+	}
+	writeState(root, sid, state);
+	return {
+		ok: true,
+		round,
+		verdict: input.verdict,
+		status: state.status,
+		rounds_left: Math.max(0, MAX_REVIEW_ROUNDS - round),
+		next:
+			state.status === "done"
+				? "구현이 끝났습니다. 변경 요약과 커밋 여부를 사용자에게 보여주세요 (자동 커밋 안 함)"
+				: state.status === "stuck"
+					? "전체를 멈춥니다. 남은 지적을 사용자에게 보여주세요"
+					: "지적을 고친 뒤 verify부터 다시 실행하세요",
+	};
+}
+
 function cmdStatus(root, sid) {
 	const state = readState(root, sid);
 	if (!state) return { ok: true, exists: false };
-	return { ok: true, exists: true, ...summary(state), reviews: state.reviews, plan: state.plan };
+	return { ok: true, exists: true, ...summary(state), ...executionSummary(state), reviews: state.reviews, plan: state.plan, final_reviews: state.execution?.final_reviews ?? [] };
 }
 
-const COMMANDS = { start: cmdStart, design: cmdDesign, plan: cmdPlan, review: cmdReview, status: cmdStatus };
+const COMMANDS = {
+	start: cmdStart,
+	design: cmdDesign,
+	plan: cmdPlan,
+	review: cmdReview,
+	execute: cmdExecute,
+	"task-done": cmdTaskDone,
+	"task-review": cmdTaskReview,
+	verify: cmdVerify,
+	"final-review": cmdFinalReview,
+	status: cmdStatus,
+};
 
 export function run(argv, cwd = process.cwd()) {
 	const { command, flags } = parseArgs(argv);
