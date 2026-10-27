@@ -18,6 +18,7 @@
 - 2026-10-22: 점수와 기록을 코드로 옮김 (f13~f17). 상태 파일, `record` 명령, 최저선 계산, 답 원문 기록, 체크리스트 채점, 스펙 저장 조건 검사를 만든다. f12의 "점수 계산·스펙 검사는 안 만듦"은 f13~f17이 대체함.
 - 2026-10-27: 플러그인 둘(deep-interview, deep-build)을 `plugins/deep-workflow` 하나로 합침. 스킬 두 개(`deep-interview`, `deep-build`)와 훅 한 벌. superpowers처럼 "플러그인 = 작업 흐름, 스킬 = 단계" 구조. 동작은 바뀌지 않음.
 - 2026-10-27: 네 에이전트(claude·codex·grok·antigravity) 리뷰 반영. deep-build: 테스트·증거 명령을 계획에 고정(task-done/verify가 명령을 받지 않음), 순환 의존은 plan에서 거부, 최종 리뷰 revise 시 작업 자동 reopen, criteria 판정 검사, start 덮어쓰기는 --restart로 분리, 인터뷰 기록과 고정 항목·조기 종료 대조, 결과 줄 정확 일치. deep-interview: 훅도 CLI와 같은 루트(git 최상위) 사용, 점수는 라운드를 넣은 뒤 계산, 안 물은 체크는 보내지 않음(SKILL), 범위 재확정에 새 답 필요, builds/ gitignore.
+- 2026-10-27: 2차 리뷰(같은 네 에이전트) 반영. deep-build: 최종 리뷰 지적의 task/target(작업·AC·파일)으로 작업을 찾아 의존 작업까지 reopen, reopen 시 시도 횟수 0부터, amend 명령(구현 중 명령만 수정), verify --criterion과 3회 실패 stuck, 설계 문서 해시 검사, 검토 세 종류 모두 blocker+pass 거부, weak는 지적 필요, 인터뷰 기록은 보관본·심볼릭 링크 경로까지 조회, 입력 검사 뒤에만 보관, build start도 gitignore, task-done은 쓰기 직전 상태 재읽기, 실패면 종료 코드 2. deep-interview: end --spec 필수, 미룬 덩어리 기록 거부, 같은 id 사실은 이번 라운드로, 같은 라운드 재기록 시 체크 정리, 기준 통과면 정체 신호 없음, 미달 덩어리 먼저 제안, 고정 항목 component, 빈 문자열 답 무시.
 
 ## 무엇을 만드나
 코드 작업을 시작하기 전에 사용자와 일대일로 인터뷰해서 요구사항의 빈 곳을 메우는 Claude Code 플러그인. 질문은 하나씩, 가장 흐릿한 곳부터 묻고, 점수로 진행 정도를 보여주며, 끝나면 스펙 파일 하나를 남기고 멈춘다.

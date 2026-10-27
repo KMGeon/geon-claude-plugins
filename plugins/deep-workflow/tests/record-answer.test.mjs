@@ -37,6 +37,8 @@ test("선택지 창에서 고른 답이 없으면(빈 응답) 기록하지 않�
 	cli(root, "start");
 	const empty = record({ hook_event_name: "PostToolUse", tool_name: "AskUserQuestion", session_id: SID, cwd: root, tool_input: { questions: [] }, tool_response: {} });
 	assert.equal(empty, false);
+	const blank = record({ hook_event_name: "PostToolUse", tool_name: "AskUserQuestion", session_id: SID, cwd: root, tool_input: { questions: [] }, tool_response: { answers: { q: "  " } } });
+	assert.equal(blank, false);
 	assert.equal(readAnswers(root, SID).length, 0);
 });
 

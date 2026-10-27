@@ -10,12 +10,15 @@
 //   execute                                     구현 시작. 작업 수로 방식을 정하고 의존 순서를 돌려준다
 //   task-done --task <id>                       계획에 고정된 그 작업의 테스트 명령을 코드가 실행, 종료 코드 0일 때만 완료
 //   task-review --task <id> --input <JSON>      (에이전트 방식) 리뷰 에이전트 판정 기록. revise도 실패로 센다
-//   reopen --task <id>                          끝난 작업을 다시 연다 (verify 실패·최종 리뷰 revise 뒤 고칠 때)
-//   verify                                      계획에 고정된 완료 기준(AC)별 증거 명령을 코드가 실행, 전부 0이어야 통과
+//   reopen --task <id>                          끝난 작업(과 그에 의존하는 작업)을 다시 연다. verify 실패·최종 리뷰 revise 뒤 고칠 때
+//   amend --input <JSON>                        구현 중에 계획의 테스트·증거 명령만 고친다. 영향받는 작업은 다시 열린다
+//   verify [--criterion <AC id>]                계획에 고정된 완료 기준(AC)별 증거 명령을 코드가 실행, 전부 0이어야 통과. 3회 실패면 stuck
 //   final-review --input <JSON>                 새 에이전트의 전체 리뷰. AC별 판정을 검사하고 pass면 done
 //   status                                      현재 상태
 // 결과는 JSON. 실패하면 {"ok": false, "error": "..."}와 종료 코드 1.
+// 명령은 기록됐지만 결과가 실패(passed: false)이거나 전체가 stuck이 됐으면 종료 코드 2 (JSON은 그대로).
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -23,9 +26,11 @@ import { execFileSync, spawnSync } from "node:child_process";
 export const DIR_NAME = ".deep-interview";
 const MAX_REVIEW_ROUNDS = 3;
 const MAX_TASK_ATTEMPTS = 3;
+const MAX_VERIFY_FAILURES = 3;
 const SINGLE_SESSION_MAX_TASKS = 3;
 const DESIGN_SECTIONS = ["시퀀스", "상태", "ERD", "API"];
-const COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
+// 명령 하나의 제한. Claude Code Bash 도구의 최대(10분)보다 짧게 두어, 코드가 먼저 끊고 결과를 저장할 수 있게 한다.
+const COMMAND_TIMEOUT_MS = 8 * 60 * 1000;
 
 class CliError extends Error {}
 const fail = message => {
@@ -41,7 +46,7 @@ const isText = value => typeof value === "string" && value.trim().length > 0;
 function parseArgs(argv) {
 	const [command, ...rest] = argv;
 	const flags = {};
-	const boolean = new Set(["force", "restart"]);
+	const boolean = new Set(["force", "restart", "all"]);
 	for (let i = 0; i < rest.length; i += 1) {
 		const token = rest[i];
 		if (!token.startsWith("--")) fail(`알 수 없는 인자입니다: ${token}`);
@@ -124,8 +129,36 @@ function writeState(root, sid, state) {
 	fs.renameSync(tmp, file);
 }
 
-/** 프로젝트 루트 기준 상대 경로 (OS와 상관없이 `/` 구분자). */
-const relative = (root, file) => path.relative(root, file).split(path.sep).join("/");
+/** 심볼릭 링크를 풀어 실제 경로를 얻는다 (macOS의 /tmp → /private/tmp 등). 없는 경로면 가능한 데까지 푼다. */
+function realish(p) {
+	try {
+		return fs.realpathSync(p);
+	} catch {
+		const parent = path.dirname(p);
+		return parent === p ? p : path.join(realish(parent), path.basename(p));
+	}
+}
+
+/** 프로젝트 루트 기준 상대 경로 (OS와 상관없이 `/` 구분자). 양쪽 다 실제 경로로 풀어 비교한다. */
+const relative = (root, file) => path.relative(realish(root), realish(file)).split(path.sep).join("/");
+
+/** 파일 내용 해시. 등록한 설계 문서가 나중에 바뀌었는지 볼 때 쓴다. */
+const fileHash = file => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex").slice(0, 16);
+
+/**
+ * `.deep-interview/.gitignore`에 `sessions/`와 `builds/`를 넣는다 (인터뷰 없이 deep-build만 써도 테스트 출력이 커밋되지 않게).
+ * 이미 있으면 없는 줄만 덧붙인다. 인터뷰 쪽 ensureGitignore와 같은 규칙이다.
+ */
+function ensureGitignore(root) {
+	const file = path.join(root, DIR_NAME, ".gitignore");
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	const current = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+	const have = new Set(current.split("\n").map(line => line.trim()));
+	const missing = ["sessions/", "builds/"].filter(line => !have.has(line));
+	if (missing.length === 0) return;
+	const prefix = current && !current.endsWith("\n") ? "\n" : "";
+	fs.writeFileSync(file, `${current}${prefix}# 딥 인터뷰 상태, 사용자 답 원문, 빌드 상태 (커밋하지 않음)\n${missing.join("\n")}\n`);
+}
 
 // =============================================================================
 // 스펙 해석
@@ -135,7 +168,8 @@ const relative = (root, file) => path.relative(root, file).split(path.sep).join(
  * 딥 인터뷰 스펙(markdown)에서 코드가 필요한 것만 뽑는다.
  * - 고정 항목: "**고정 항목**"(또는 "## 고정 항목" 제목) 아래 "- `ID` — 설명" 또는 "- **ID** — 설명" 줄
  * - 완료 기준: "## 다 됐다는 기준" 아래 "- [ ] ..." 줄. 순서대로 AC-1, AC-2… id를 붙인다
- * - 결과: "- 결과: 기준 통과" 줄이 정확히 그 내용일 때만 통과. 양식의 "기준 통과 | 기준 미달로 조기 종료"를 그대로 두면 미달로 본다
+ * - 결과: "- 결과: 기준 통과" 줄(뒤에 괄호 주석은 허용). 양식의 "기준 통과 | 기준 미달로 조기 종료"를 그대로 두면 미달로 본다.
+ *   인터뷰 상태 파일이 있으면 start가 그쪽을 기준으로 다시 정한다
  * - 제목, 한 문장 요약
  */
 export function parseSpec(markdown) {
@@ -143,7 +177,7 @@ export function parseSpec(markdown) {
 	const title = (lines.find(line => line.startsWith("# ")) ?? "# (제목 없음)").slice(2).replace(/\s*—\s*딥 인터뷰 스펙\s*$/, "").trim();
 	const summary = lines.find(line => /^- 한 문장 요약:/.test(line))?.replace(/^- 한 문장 요약:\s*/, "").trim() ?? null;
 	const resultLine = lines.find(line => /^- 결과:/.test(line)) ?? "";
-	const passed = /^- 결과:\s*기준 통과\s*$/.test(resultLine.trim());
+	const passed = /^- 결과:\s*기준 통과\s*(?:[(（][^|]*[)）])?\s*$/.test(resultLine.trim());
 
 	const fixedItems = [];
 	const criteria = [];
@@ -157,7 +191,8 @@ export function parseSpec(markdown) {
 			mode = "criteria";
 			continue;
 		}
-		if (/^#{1,4} /.test(line) || /^\*\*[^*]+\*\*\s*$/.test(line)) {
+		// 제목은 어느 절이든 닫는다. 굵은 글씨 소제목은 고정 항목 절만 닫는다 (완료 기준 절 안의 "**예외**" 같은 소제목은 통과).
+		if (/^#{1,4} /.test(line) || (mode === "fixed" && /^\*\*[^*]+\*\*\s*$/.test(line))) {
 			if (mode) mode = null;
 			continue;
 		}
@@ -174,25 +209,36 @@ export function parseSpec(markdown) {
 
 /**
  * 이 스펙을 만든 딥 인터뷰 세션의 상태를 찾는다 (end --spec으로 남긴 spec_path가 같은 것).
- * 세션이 달라도 찾는다. 없으면 null. 스펙 글에서 빠뜨린 고정 항목과 조기 종료 여부를 대조하는 데 쓴다.
+ * 세션이 달라도, 같은 세션에서 새 인터뷰를 시작해 state-<시각>.json으로 보관됐어도 찾는다. 없으면 null.
+ * 스펙 글에서 빠뜨린 고정 항목과 조기 종료 여부를 대조하는 데 쓴다.
  */
 export function findInterviewState(root, specAbs) {
+	const dir = sessionsDir(root);
 	let entries = [];
 	try {
-		entries = fs.readdirSync(sessionsDir(root));
+		entries = fs.readdirSync(dir);
 	} catch {
 		return null;
 	}
+	const target = realish(specAbs);
 	let best = null;
 	for (const name of entries) {
-		let state;
+		let files = [];
 		try {
-			state = JSON.parse(fs.readFileSync(path.join(sessionsDir(root), name, "state.json"), "utf8"));
+			files = fs.readdirSync(path.join(dir, name)).filter(f => /^state(-.*)?\.json$/.test(f));
 		} catch {
 			continue;
 		}
-		if (!isText(state?.spec_path) || path.resolve(root, state.spec_path) !== specAbs) continue;
-		if (!best || String(state.ended_at ?? "") > String(best.ended_at ?? "")) best = state;
+		for (const file of files) {
+			let state;
+			try {
+				state = JSON.parse(fs.readFileSync(path.join(dir, name, file), "utf8"));
+			} catch {
+				continue;
+			}
+			if (!isText(state?.spec_path) || realish(path.resolve(root, state.spec_path)) !== target) continue;
+			if (!best || String(state.ended_at ?? "") > String(best.ended_at ?? "")) best = state;
+		}
 	}
 	return best;
 }
@@ -218,9 +264,10 @@ export function checkDesign(markdown) {
 		const start = headings[at].index;
 		const end = headings[at + 1]?.index ?? markdown.length;
 		const body = markdown.slice(start, end);
-		const hasMermaid = /```mermaid/.test(body);
+		// 빈 펜스는 내용으로 치지 않는다. "생략:"은 목록 표시나 굵은 글씨가 붙어도 받는다.
+		const hasMermaid = /```mermaid[^\n]*\n(?:[ \t]*\n)*[ \t]*\S[^\n]*\n[\s\S]*?```/.test(body);
 		const hasTable = /^\|.*\|\s*$/m.test(body);
-		const hasSkip = /^생략\s*[:：]\s*\S/m.test(body);
+		const hasSkip = /^(?:[-*>]\s*)?(?:\*\*생략\*\*|생략)\s*[:：]\s*\S/m.test(body);
 		if (name === "API" ? !(hasTable || hasMermaid || hasSkip) : !(hasMermaid || hasSkip)) {
 			problems.push(`"## ${name}" 절에 ${name === "API" ? "표" : "Mermaid 블록"}도, "생략: <이유>" 한 줄도 없습니다`);
 		}
@@ -276,13 +323,20 @@ export function checkPlan(plan, spec) {
 			else coveredCriteria.add(id);
 		}
 	}
+	let depsOk = true;
 	for (const task of tasks) {
-		for (const dep of listOrNull(task?.depends_on) ?? []) {
+		const deps = listOrNull(task?.depends_on);
+		if (!deps) {
+			depsOk = false;
+			continue;
+		}
+		for (const dep of deps) {
 			if (!ids.has(dep)) problems.push(`${task.id}: depends_on의 ${dep}는 없는 작업입니다`);
 			if (dep === task.id) problems.push(`${task.id}: 자기 자신에 의존할 수 없습니다`);
 		}
 	}
-	if (problems.length === 0) {
+	// 의존 형식이 맞으면 다른 오류가 있어도 순환은 같이 알려준다 (두 번에 나눠 거부하지 않게).
+	if (depsOk && tasks.every(task => isText(task?.id))) {
 		try {
 			taskOrder(tasks);
 		} catch (error) {
@@ -370,25 +424,30 @@ function summary(state) {
 // 아직 끝나지 않은 빌드 상태. 이 상태의 빌드는 --restart 없이 덮어쓰지 않는다.
 const IN_PROGRESS = new Set(["designing", "planning", "reviewing", "revising", "planned", "executing"]);
 
-/** 스펙을 읽어 빌드 상태를 만든다. */
+/** 스펙을 읽어 빌드 상태를 만든다. 입력 검사를 모두 끝낸 뒤에만 기존 상태를 건드린다. */
 function cmdStart(root, sid, flags) {
 	if (!isText(flags.spec)) fail("--spec <스펙 경로>가 필요합니다");
-	const abs = path.resolve(root, flags.spec);
+	const abs = realish(path.resolve(root, flags.spec));
 	if (!fs.existsSync(abs)) fail(`스펙 파일이 없습니다: ${flags.spec}`);
+	const slug = isText(flags.slug) ? flags.slug : path.basename(abs, ".md").replace(/^deep-interview-/, "");
+	if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) fail(`계획 파일 이름(slug)은 소문자·숫자·하이픈만 쓸 수 있습니다: ${JSON.stringify(slug)}. --slug <이름>으로 따로 정하세요`);
 	const spec = parseSpec(fs.readFileSync(abs, "utf8"));
 	const warnings = [];
 
-	// 스펙 글은 Claude가 옮겨 적은 것이다. 인터뷰 상태 파일이 있으면 그것을 기준으로 빠진 고정 항목과 조기 종료를 대조한다.
+	// 스펙 글은 Claude가 옮겨 적은 것이다. 인터뷰 상태 파일이 있으면 그것을 기준으로 삼는다:
+	// 빠진 고정 항목(미룬 덩어리의 것은 제외), 조기 종료 여부.
 	const interview = findInterviewState(root, abs);
 	if (interview) {
+		const deferred = new Set((interview.components ?? []).filter(c => c.status === "deferred").map(c => c.id));
 		const written = new Set(spec.fixed_items.map(item => item.id));
-		const missing = (interview.fixed_items ?? []).filter(item => !written.has(item.id));
+		const missing = (interview.fixed_items ?? []).filter(item => !written.has(item.id) && !(item.component && deferred.has(item.component)));
 		if (missing.length) {
-			fail(`스펙에 빠진 고정 항목이 있습니다: ${missing.map(item => `\`${item.id}\``).join(", ")}. 인터뷰에서 확정한 고정 항목은 모두 "**고정 항목**" 아래 "- \`ID\` — 설명" 줄로 넣어야 합니다`);
+			fail(`스펙에 빠진 고정 항목이 있습니다: ${missing.map(item => `\`${item.id}\``).join(", ")}. 인터뷰에서 확정한 고정 항목은 모두 "**고정 항목**" 아래 "- \`ID\` — 설명" 줄로 넣어야 합니다 (미룬 덩어리의 항목은 빼도 됩니다)`);
 		}
-		if (interview.early_exit === true) spec.passed = false;
-	} else if (spec.fixed_items.length === 0) {
-		warnings.push('스펙에서 고정 항목을 찾지 못했습니다. "**고정 항목**" 아래 "- `ID` — 설명" 형식인지 확인하세요. 고정 항목이 없으면 계획의 연결 검사가 완료 기준만 봅니다');
+		spec.passed = interview.status === "done" && interview.early_exit !== true;
+	} else {
+		warnings.push("이 스펙을 만든 인터뷰 기록을 찾지 못했습니다 (end --spec으로 끝낸 인터뷰가 없거나 경로가 다름). 스펙 글만 보고 진행합니다");
+		if (spec.fixed_items.length === 0) warnings.push('스펙에서 고정 항목을 찾지 못했습니다. "**고정 항목**" 아래 "- `ID` — 설명" 형식인지 확인하세요. 고정 항목이 없으면 계획의 연결 검사가 완료 기준만 봅니다');
 	}
 	if (!spec.passed && flags.force !== true) {
 		fail("이 스펙은 기준 미달로 조기 종료된 스펙입니다. 사용자에게 남은 빈 곳을 보여주고 진행 여부를 물은 뒤, 진행하기로 했으면 --force를 붙이세요");
@@ -398,13 +457,12 @@ function cmdStart(root, sid, flags) {
 	if (existing && IN_PROGRESS.has(existing.status) && flags.restart !== true) {
 		fail(`이 세션에 진행 중인 빌드가 있습니다 (상태: ${existing.status}). 이어가려면 status를 보고, 버리고 새로 시작하려면 --restart를 붙이세요`);
 	}
+	// 여기까지 왔으면 입력은 모두 유효하다. 끝난(또는 버리는) 빌드는 지우지 않고 이름을 바꿔 보관한다.
 	if (existing) {
-		// 끝난(또는 버리는) 빌드는 지우지 않고 이름을 바꿔 보관한다.
 		const stamp = (existing.done_at ?? existing.updated_at ?? existing.created_at ?? new Date().toISOString()).replace(/[:.]/g, "-");
 		fs.renameSync(statePath(root, sid), statePath(root, sid).replace(/\.json$/, `-${stamp}.json`));
 	}
-	const slug = isText(flags.slug) ? flags.slug : path.basename(abs, ".md").replace(/^deep-interview-/, "");
-	if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) fail(`계획 파일 이름(slug)은 소문자·숫자·하이픈만 쓸 수 있습니다: ${JSON.stringify(slug)}. --slug <이름>으로 따로 정하세요`);
+	ensureGitignore(root);
 	const state = {
 		version: 1,
 		session: sid,
@@ -414,31 +472,46 @@ function cmdStart(root, sid, flags) {
 		forced: !spec.passed,
 		status: "designing",
 		design_path: null,
+		design_hash: null,
 		plan_path: null,
 		plan: null,
 		reviews: [],
+		amendments: [],
 		created_at: new Date().toISOString(),
 	};
 	writeState(root, sid, state);
 	return { ok: true, ...summary(state), spec_title: spec.title, interview_checked: Boolean(interview), warnings, next: "설계 문서를 쓰고 design --file로 등록" };
 }
 
-/** 설계 문서를 검사하고 등록한다. */
+/** 설계 문서를 검사하고 등록한다. 검토 통과 뒤에 다시 등록하면 검토를 다시 받아야 한다. */
 function cmdDesign(root, sid, flags) {
 	const state = requireState(root, sid);
-	// 검토를 통과하기 전까지는 설계를 다시 등록할 수 있다 (계획을 쓰다 설계를 고치는 경우, 검토 지적으로 설계만 고치는 경우).
-	if (!["designing", "planning", "reviewing", "revising"].includes(state.status)) fail(`설계 문서는 검토 통과 전(designing/planning/reviewing/revising)에만 등록할 수 있습니다 (현재: ${state.status})`);
+	if (!["designing", "planning", "reviewing", "revising", "planned"].includes(state.status)) fail(`설계 문서는 구현 시작 전(designing/planning/reviewing/revising/planned)에만 등록할 수 있습니다 (현재: ${state.status})`);
 	if (!isText(flags.file)) fail("--file <설계 문서 경로>가 필요합니다");
 	const abs = path.resolve(root, flags.file);
 	if (!fs.existsSync(abs)) fail(`설계 문서가 없습니다: ${flags.file}`);
 	const problems = checkDesign(fs.readFileSync(abs, "utf8"));
 	if (problems.length) fail(`설계 문서가 완성되지 않았습니다: ${problems.join(" / ")}`);
 	state.design_path = relative(root, abs);
+	state.design_hash = fileHash(abs);
 	if (state.status === "designing") state.status = "planning";
-	// 검토 지적으로 설계만 고쳤으면 계획은 그대로 두고 다시 검토로 간다.
-	else if (state.status === "revising" && state.plan) state.status = "reviewing";
+	// 검토 지적으로 설계만 고쳤거나(revising), 검토 통과 뒤 설계를 바꿨으면(planned) 계획은 그대로 두고 다시 검토로 간다.
+	else if (["revising", "planned"].includes(state.status) && state.plan) state.status = "reviewing";
 	writeState(root, sid, state);
 	return { ok: true, ...summary(state), next: state.status === "reviewing" ? "검토 에이전트에게 다시 검토를 맡기고 review --input으로 기록" : "작업 목록을 만들어 plan --input으로 등록" };
+}
+
+/** 검토 판정 입력을 검사한다. 지적마다 target·finding이 있어야 하고, blocker가 있으면 pass일 수 없다. */
+function validateVerdict(input) {
+	if (!["pass", "revise"].includes(input.verdict)) fail('verdict는 "pass" 또는 "revise"여야 합니다');
+	const findings = Array.isArray(input.findings) ? input.findings : [];
+	for (const f of findings) {
+		if (!isText(f?.finding) || !isText(f?.target)) fail("findings의 항목마다 target과 finding이 필요합니다");
+	}
+	const blockers = findings.filter(f => f.severity === "blocker");
+	if (input.verdict === "revise" && findings.length === 0) fail("revise 판정에는 findings가 하나 이상 있어야 합니다");
+	if (input.verdict === "pass" && blockers.length) fail("blocker 지적이 있으면 verdict는 revise여야 합니다 (사소한 것은 severity를 minor로)");
+	return { findings, blockers };
 }
 
 /** 계획을 검사하고 계획 파일을 쓴다. */
@@ -465,12 +538,7 @@ function cmdReview(root, sid, flags) {
 	const state = requireState(root, sid);
 	if (state.status !== "reviewing") fail(`검토는 reviewing 상태에서만 기록할 수 있습니다 (현재: ${state.status})`);
 	const input = readInput(flags);
-	if (!["pass", "revise"].includes(input.verdict)) fail('verdict는 "pass" 또는 "revise"여야 합니다');
-	const findings = Array.isArray(input.findings) ? input.findings : [];
-	if (input.verdict === "revise" && findings.length === 0) fail("revise 판정에는 findings가 하나 이상 있어야 합니다");
-	for (const f of findings) {
-		if (!isText(f?.finding) || !isText(f?.target)) fail("findings의 항목마다 target과 finding이 필요합니다");
-	}
+	const { findings } = validateVerdict(input);
 	const round = state.reviews.length + 1;
 	state.reviews.push({ round, verdict: input.verdict, findings, summary: input.summary ?? null, recorded_at: new Date().toISOString() });
 	if (input.verdict === "pass") state.status = "planned";
@@ -571,10 +639,20 @@ function executionSummary(state) {
 	};
 }
 
+/** 등록한 설계 문서가 그 뒤에 바뀌었으면 거부한다. 검토는 등록된 문서를 본 것이기 때문이다. */
+function requireDesignUnchanged(root, state) {
+	if (!state.design_path || !state.design_hash) return;
+	const abs = path.resolve(root, state.design_path);
+	if (!fs.existsSync(abs) || fileHash(abs) !== state.design_hash) {
+		fail(`설계 문서(${state.design_path})가 등록한 뒤에 바뀌었습니다. design --file로 다시 등록하고 검토를 다시 받으세요`);
+	}
+}
+
 /** 구현을 시작한다. 작업 수로 방식을 고른다. */
 function cmdExecute(root, sid, flags) {
 	const state = requireState(root, sid);
 	if (state.status !== "planned") fail(`구현은 검토를 통과한(planned) 뒤에만 시작할 수 있습니다 (현재: ${state.status})`);
+	requireDesignUnchanged(root, state);
 	const tasks = state.plan.tasks;
 	const order = taskOrder(tasks);
 	state.execution = {
@@ -582,6 +660,7 @@ function cmdExecute(root, sid, flags) {
 		order,
 		tasks: Object.fromEntries(order.map(id => [id, { status: "pending", attempts: 0, runs: [], reviews: [] }])),
 		criteria_evidence: null,
+		verify_failures: 0,
 		final_reviews: [],
 		started_at: new Date().toISOString(),
 	};
@@ -609,13 +688,25 @@ function recordFailure(state, id, reason) {
 	}
 }
 
-/** 계획에 고정된 그 작업의 테스트 명령을 코드가 실행해 작업 완료를 판정한다. 명령은 바꿀 수 없다. */
+/** 작업이 끝난 뒤 다음에 할 일 안내. 리뷰 대기 작업이 남았으면 verify보다 그것을 먼저 알린다. */
+function afterTaskNext(state) {
+	const next = nextTask(state);
+	if (next) return `다음 작업: ${next}`;
+	const waiting = awaitingReview(state);
+	if (waiting.length) return `리뷰 대기 중인 작업이 있습니다: ${waiting.join(", ")}. task-review로 판정을 기록하세요`;
+	return "모든 작업이 끝났습니다. verify로 완료 기준 증거를 기록하세요";
+}
+
+/**
+ * 계획에 고정된 그 작업의 테스트 명령을 코드가 실행해 작업 완료를 판정한다. 명령은 바꿀 수 없다.
+ * 테스트가 도는 동안 다른 task-done이 상태를 바꿨을 수 있으므로, 쓰기 직전에 상태를 다시 읽어 이 작업 칸만 갱신한다.
+ */
 function cmdTaskDone(root, sid, flags) {
 	const state = requireState(root, sid);
 	const ex = requireExecuting(state);
 	const id = flags.task;
 	if (!isText(id) || !ex.tasks[id]) fail(`--task는 계획의 작업 id여야 합니다: ${id}`);
-	if (flags.cmd !== undefined) fail("task-done은 --cmd를 받지 않습니다. 계획(plan)의 test_cmd를 그대로 실행합니다. 명령을 바꿔야 하면 계획을 고치고 다시 검토받으세요");
+	if (flags.cmd !== undefined) fail("task-done은 --cmd를 받지 않습니다. 계획(plan)의 test_cmd를 그대로 실행합니다. 명령을 바꿔야 하면 amend --input으로 계획을 고치세요");
 	if (ex.tasks[id].status === "done") fail(`${id}는 이미 끝난 작업입니다. 고쳐서 다시 테스트하려면 먼저 reopen --task ${id}를 실행하세요`);
 	if (ex.tasks[id].status === "awaiting_review") fail(`${id}는 리뷰 대기 중입니다. 먼저 task-review로 판정을 기록하세요`);
 	const ready = readyTasks(state);
@@ -623,14 +714,18 @@ function cmdTaskDone(root, sid, flags) {
 
 	const cmd = state.plan.tasks.find(x => x.id === id).test_cmd;
 	const run = runCommand(root, cmd);
-	const t = ex.tasks[id];
+
+	// 테스트가 도는 동안 바뀐 상태를 다시 읽고, 이 작업 칸과 전체 멈춤만 반영한다.
+	const fresh = readState(root, sid) ?? state;
+	if (fresh.status !== "executing") fail(`테스트를 실행하는 사이 빌드 상태가 바뀌었습니다 (현재: ${fresh.status}). 결과는 기록하지 않습니다`);
+	const t = fresh.execution.tasks[id];
 	t.runs.push({ ...run, at: new Date().toISOString() });
 	if (run.exit_code === 0) {
-		t.status = ex.mode === "agents" ? "awaiting_review" : "done";
+		t.status = fresh.execution.mode === "agents" ? "awaiting_review" : "done";
 	} else {
-		recordFailure(state, id, run.timed_out ? "테스트 시간 초과" : `테스트 종료 코드 ${run.exit_code}`);
+		recordFailure(fresh, id, run.timed_out ? "테스트 시간 초과" : `테스트 종료 코드 ${run.exit_code}`);
 	}
-	writeState(root, sid, state);
+	writeState(root, sid, fresh);
 	return {
 		ok: true,
 		task: id,
@@ -639,18 +734,16 @@ function cmdTaskDone(root, sid, flags) {
 		output_tail: run.output_tail,
 		attempts: t.attempts,
 		attempts_left: Math.max(0, MAX_TASK_ATTEMPTS - t.attempts),
-		status: state.status,
+		status: fresh.status,
 		task_status: t.status,
-		...executionSummary(state),
+		...executionSummary(fresh),
 		next:
-			state.status === "stuck"
+			fresh.status === "stuck"
 				? "전체를 멈춥니다. 끝난 작업·남은 작업·실패 이유를 사용자에게 보여주세요"
 				: t.status === "awaiting_review"
 					? `리뷰 에이전트에게 ${id}의 변경을 검토시키고 task-review로 기록하세요`
 					: t.status === "done"
-						? nextTask(state)
-							? `다음 작업: ${nextTask(state)}`
-							: "모든 작업이 끝났습니다. verify로 완료 기준 증거를 기록하세요"
+						? afterTaskNext(fresh)
 						: `${id}를 고치고 다시 task-done을 실행하세요 (남은 시도 ${Math.max(0, MAX_TASK_ATTEMPTS - t.attempts)}회)`,
 	};
 }
@@ -665,9 +758,7 @@ function cmdTaskReview(root, sid, flags) {
 	const t = ex.tasks[id];
 	if (t.status !== "awaiting_review") fail(`${id}는 리뷰 대기 상태가 아닙니다 (현재: ${t.status}). 먼저 task-done으로 테스트를 통과시키세요`);
 	const input = readInput(flags);
-	if (!["pass", "revise"].includes(input.verdict)) fail('verdict는 "pass" 또는 "revise"여야 합니다');
-	const findings = Array.isArray(input.findings) ? input.findings : [];
-	if (input.verdict === "revise" && findings.length === 0) fail("revise 판정에는 findings가 하나 이상 있어야 합니다");
+	const { findings } = validateVerdict(input);
 	t.reviews.push({ verdict: input.verdict, findings, summary: input.summary ?? null, at: new Date().toISOString() });
 	if (input.verdict === "pass") t.status = "done";
 	else recordFailure(state, id, `리뷰 revise: ${findings[0]?.finding ?? ""}`);
@@ -684,20 +775,51 @@ function cmdTaskReview(root, sid, flags) {
 			state.status === "stuck"
 				? "전체를 멈춥니다. 끝난 작업·남은 작업·실패 이유를 사용자에게 보여주세요"
 				: t.status === "done"
-					? nextTask(state)
-						? `다음 작업: ${nextTask(state)}`
-						: "모든 작업이 끝났습니다. verify로 완료 기준 증거를 기록하세요"
+					? afterTaskNext(state)
 					: `${id}의 지적을 고치고 다시 task-done부터 실행하세요`,
 	};
 }
 
-/** 끝난 작업을 다시 연다. 다시 열면 그 작업과 증거는 무효가 되고, task-done(과 리뷰)을 다시 통과해야 한다. */
+/** 이 작업에 (직접·간접으로) 의존하는 작업 id들. 앞 작업을 고치면 뒤 작업의 테스트도 다시 돌아야 한다. */
+function dependentsOf(state, id) {
+	const out = new Set();
+	const visit = target => {
+		for (const task of state.plan.tasks) {
+			if ((task.depends_on ?? []).includes(target) && !out.has(task.id)) {
+				out.add(task.id);
+				visit(task.id);
+			}
+		}
+	};
+	visit(id);
+	return [...out];
+}
+
+/**
+ * 끝난 작업을 다시 연다. 그 작업에 의존하는 작업도 함께 연다 (앞 작업이 바뀌면 뒤 작업의 통과도 무효).
+ * 시도 횟수는 0부터 다시 센다 (이전 횟수는 total_attempts에 남긴다). 증거는 무효가 된다. 다시 연 작업 id 목록을 돌려준다.
+ */
 function reopenTask(state, id) {
-	const t = state.execution.tasks[id];
-	if (!t) fail(`계획에 없는 작업입니다: ${id}`);
-	t.status = "pending";
-	t.reopened = (t.reopened ?? 0) + 1;
-	state.execution.criteria_evidence = null;
+	const ex = state.execution;
+	if (!ex.tasks[id]) fail(`계획에 없는 작업입니다: ${id}`);
+	const reopened = [];
+	for (const target of [id, ...dependentsOf(state, id)]) {
+		const t = ex.tasks[target];
+		if (target !== id && t.status === "pending") continue; // 아직 시작도 안 한 뒤 작업은 그대로
+		t.status = "pending";
+		t.total_attempts = (t.total_attempts ?? 0) + t.attempts;
+		t.attempts = 0;
+		t.reopened = (t.reopened ?? 0) + 1;
+		reopened.push(target);
+	}
+	ex.criteria_evidence = null;
+	return reopened;
+}
+
+/** 다시 연 작업을 끝내는 길 안내. 에이전트 방식이면 task-review까지 거쳐야 한다. */
+function reopenNext(state, ids) {
+	const review = state.execution.mode === "agents" ? " → task-review로 pass" : "";
+	return `다시 연 작업(${ids.join(", ")})을 고치고 task-done${review}으로 다시 통과시킨 뒤 verify부터 다시 실행하세요`;
 }
 
 /** verify 실패나 최종 리뷰 revise 뒤 작업을 고칠 때 쓴다. */
@@ -707,61 +829,152 @@ function cmdReopen(root, sid, flags) {
 	const id = flags.task;
 	if (!isText(id) || !ex.tasks[id]) fail(`--task는 계획의 작업 id여야 합니다: ${id}`);
 	if (ex.tasks[id].status !== "done") fail(`${id}는 끝난 작업이 아닙니다 (현재: ${ex.tasks[id].status})`);
-	reopenTask(state, id);
+	const reopened = reopenTask(state, id);
 	writeState(root, sid, state);
-	return { ok: true, task: id, task_status: "pending", status: state.status, ...executionSummary(state), next: `${id}를 고치고 task-done --task ${id}로 테스트를 다시 통과시키세요. 끝나면 verify부터 다시` };
+	return { ok: true, task: id, task_status: "pending", reopened_tasks: reopened, status: state.status, ...executionSummary(state), next: reopenNext(state, reopened) };
 }
 
-/** 계획에 고정된 완료 기준별 증거 명령을 실행한다. 전부 종료 코드 0이어야 통과. */
+/**
+ * 구현 중에 계획의 테스트 명령·증거 명령만 고친다 (경로 오타 등). 다른 필드는 못 바꾼다.
+ * 명령이 바뀐 작업이 끝나 있었으면 다시 열고, 증거는 무효로 돌린다. 고친 내용은 amendments에 남아 최종 리뷰어가 본다.
+ * 입력: { "tasks": { "T1": { "test_cmd": "..." } }, "evidence": { "AC-1": { "cmd": "...", "note": "..." } } }
+ */
+function cmdAmend(root, sid, flags) {
+	const state = requireState(root, sid);
+	const ex = requireExecuting(state);
+	const input = readInput(flags);
+	const taskChanges = input.tasks && typeof input.tasks === "object" && !Array.isArray(input.tasks) ? input.tasks : {};
+	const evidenceChanges = input.evidence && typeof input.evidence === "object" && !Array.isArray(input.evidence) ? input.evidence : {};
+	if (Object.keys(taskChanges).length === 0 && Object.keys(evidenceChanges).length === 0) fail('고칠 것이 없습니다: { "tasks": { "<id>": { "test_cmd": "..." } }, "evidence": { "<AC id>": { "cmd": "..." } } }');
+	const changes = [];
+	for (const [id, change] of Object.entries(taskChanges)) {
+		const task = state.plan.tasks.find(t => t.id === id) ?? fail(`계획에 없는 작업입니다: ${id}`);
+		if (!isText(change?.test_cmd)) fail(`tasks.${id}.test_cmd가 필요합니다 (작업에서 고칠 수 있는 것은 test_cmd뿐입니다)`);
+		changes.push({ kind: "task", id, from: task.test_cmd, to: change.test_cmd });
+		task.test_cmd = change.test_cmd;
+	}
+	const criteriaIds = new Set(state.spec.criteria.map(c => c.id));
+	for (const [id, change] of Object.entries(evidenceChanges)) {
+		if (!criteriaIds.has(id)) fail(`스펙에 없는 완료 기준입니다: ${id}`);
+		if (!isText(change?.cmd)) fail(`evidence.${id}.cmd가 필요합니다`);
+		const before = state.plan.evidence[id] ?? {};
+		changes.push({ kind: "evidence", id, from: before.cmd ?? null, to: change.cmd });
+		state.plan.evidence[id] = { cmd: change.cmd, note: change.note ?? before.note ?? null };
+	}
+	const reopened = [];
+	for (const change of changes) {
+		if (change.kind === "task" && ex.tasks[change.id].status !== "pending") reopened.push(...reopenTask(state, change.id));
+	}
+	ex.criteria_evidence = null;
+	state.amendments = [...(state.amendments ?? []), { at: new Date().toISOString(), changes }];
+	// 계획 파일도 다시 쓴다 (사람이 보는 문서가 상태와 어긋나지 않게).
+	fs.writeFileSync(path.join(root, state.plan_path), renderPlan(state.plan, state.spec, { spec_path: state.spec_path, design_path: state.design_path, date: new Date().toISOString().slice(0, 10) }));
+	writeState(root, sid, state);
+	const unique = [...new Set(reopened)];
+	return { ok: true, changes, reopened_tasks: unique, status: state.status, ...executionSummary(state), next: unique.length ? reopenNext(state, unique) : "verify부터 다시 실행하세요" };
+}
+
+/**
+ * 계획에 고정된 완료 기준별 증거 명령을 실행한다. 전부 종료 코드 0이어야 통과.
+ * --criterion <AC id>를 주면 그 하나만 실행하고 결과를 쌓는다 (명령이 길어 한 번에 다 돌리기 어려울 때).
+ * 전체 실행이 실패한 횟수가 3회면 stuck.
+ */
 function cmdVerify(root, sid, flags) {
 	const state = requireState(root, sid);
 	const ex = requireExecuting(state);
 	const unfinished = Object.entries(ex.tasks).filter(([, t]) => t.status !== "done").map(([id]) => id);
 	if (unfinished.length) fail(`아직 끝나지 않은 작업이 있습니다: ${unfinished.join(", ")}`);
-	if (flags.input !== undefined) fail("verify는 --input을 받지 않습니다. 계획(plan)의 evidence 명령을 그대로 실행합니다. 명령을 바꿔야 하면 계획을 고치고 다시 검토받으세요");
+	if (flags.input !== undefined) fail("verify는 --input을 받지 않습니다. 계획(plan)의 evidence 명령을 그대로 실행합니다. 명령을 바꿔야 하면 amend --input으로 계획을 고치세요");
 	const evidence = state.plan.evidence ?? {};
-	const results = {};
-	const failed = [];
+	const only = flags.criterion;
+	if (only !== undefined && !state.spec.criteria.some(c => c.id === only)) fail(`--criterion은 스펙의 완료 기준 id여야 합니다: ${only}`);
+	const results = only !== undefined ? { ...(ex.criteria_evidence?.results ?? {}) } : {};
 	for (const c of state.spec.criteria) {
+		if (only !== undefined && c.id !== only) continue;
 		const entry = evidence[c.id];
 		if (!entry || !isText(entry.cmd)) {
-			failed.push(`${c.id}: 계획에 증거 명령이 없습니다`);
+			results[c.id] = { cmd: null, exit_code: null, output_tail: "", note: null, text: c.text };
 			continue;
 		}
 		const run = runCommand(root, entry.cmd);
 		results[c.id] = { ...run, note: entry.note ?? null, text: c.text };
-		if (run.exit_code !== 0) failed.push(`${c.id}: 종료 코드 ${run.exit_code}`);
 	}
-	ex.criteria_evidence = { results, at: new Date().toISOString(), passed: failed.length === 0 };
+	const failed = [];
+	for (const c of state.spec.criteria) {
+		const r = results[c.id];
+		if (!r) failed.push(`${c.id}: 아직 실행하지 않음`);
+		else if (r.cmd === null) failed.push(`${c.id}: 계획에 증거 명령이 없습니다`);
+		else if (r.exit_code !== 0) failed.push(`${c.id}: 종료 코드 ${r.exit_code}`);
+	}
+	const passed = failed.length === 0;
+	ex.criteria_evidence = { results, at: new Date().toISOString(), passed };
+	// 하나씩 실행하는 중에는 "아직 실행하지 않음"을 실패로 세지 않는다. 실제로 명령이 실패했을 때만 센다.
+	const realFailure = failed.some(f => !f.endsWith("아직 실행하지 않음"));
+	if (realFailure) {
+		ex.verify_failures = (ex.verify_failures ?? 0) + 1;
+		if (ex.verify_failures >= MAX_VERIFY_FAILURES) {
+			state.status = "stuck";
+			ex.failed_reason = `verify ${MAX_VERIFY_FAILURES}회 실패: ${failed.join(", ")}`;
+		}
+	}
 	writeState(root, sid, state);
-	if (failed.length) {
-		return { ok: true, passed: false, failed, results, next: "실패한 완료 기준을 고치고 verify를 다시 실행하세요. 작업을 고쳐야 하면 reopen --task <id> 뒤 task-done으로 그 작업의 테스트를 다시 통과시키세요" };
+	if (state.status === "stuck") return { ok: true, passed: false, failed, results, status: "stuck", failed_reason: ex.failed_reason, next: "전체를 멈춥니다. 실패한 완료 기준과 출력을 사용자에게 보여주세요" };
+	if (!passed) {
+		return {
+			ok: true,
+			passed: false,
+			failed,
+			results,
+			verify_failures_left: Math.max(0, MAX_VERIFY_FAILURES - (ex.verify_failures ?? 0)),
+			next: only !== undefined && !realFailure
+				? `남은 완료 기준을 verify --criterion <id>로 이어서 실행하세요`
+				: "실패한 완료 기준을 고치고 verify를 다시 실행하세요. 작업을 고쳐야 하면 reopen --task <id> 뒤 task-done으로 그 작업의 테스트를 다시 통과시키고, 명령 자체가 틀렸으면 amend --input으로 고치세요",
+		};
 	}
 	return { ok: true, passed: true, results, next: "새 리뷰 에이전트에게 전체 변경을 스펙과 대조시키고 final-review로 기록하세요" };
 }
 
 /**
+ * 최종 리뷰 지적이 가리키는 작업을 찾는다. 지적의 `task`(작업 id)가 있으면 그것, 없으면 target으로 찾는다:
+ * 작업 id 그대로 / AC id면 그 기준을 담당하는 작업(covers.criteria) / 파일 경로("파일:줄"의 줄 번호는 버림)면 그 파일을 고치는 작업(files).
+ */
+export function tasksForFinding(plan, finding) {
+	const ids = new Set();
+	const byId = id => plan.tasks.some(t => t.id === id);
+	if (isText(finding?.task) && byId(finding.task)) ids.add(finding.task);
+	const target = isText(finding?.target) ? finding.target.trim() : "";
+	if (byId(target)) ids.add(target);
+	for (const task of plan.tasks) {
+		if ((task.covers?.criteria ?? []).includes(target)) ids.add(task.id);
+		const file = target.replace(/:\d+(-\d+)?$/, "");
+		if ((task.files ?? []).some(f => f === file || f.endsWith(`/${file}`) || file.endsWith(`/${f}`))) ids.add(task.id);
+	}
+	return [...ids];
+}
+
+/**
  * 전체 리뷰 판정을 기록한다. pass면 done, 3회 revise면 stuck.
- * AC별 판정(criteria)은 모두 있어야 하고, fail이 있으면 pass일 수 없다 (구조 모순은 코드가 거른다).
- * revise면 지적이 가리키는 작업(target이 작업 id)을 다시 열어 task-done부터 다시 통과하게 한다.
+ * AC별 판정(criteria)은 모두 있어야 하고, fail이나 blocker가 있으면 pass일 수 없다. weak는 그 AC를 가리키는 지적(왜 약한지)이 있어야 pass로 받는다.
+ * revise면 blocker 지적이 가리키는 작업(작업 id, AC id, 파일)을 다시 열어 task-done부터 다시 통과하게 한다.
  */
 function cmdFinalReview(root, sid, flags) {
 	const state = requireState(root, sid);
 	const ex = requireExecuting(state);
 	if (!ex.criteria_evidence?.passed) fail("verify가 통과한 뒤에만 최종 리뷰를 기록할 수 있습니다");
+	requireDesignUnchanged(root, state);
 	const input = readInput(flags);
-	if (!["pass", "revise"].includes(input.verdict)) fail('verdict는 "pass" 또는 "revise"여야 합니다');
-	const findings = Array.isArray(input.findings) ? input.findings : [];
-	if (input.verdict === "revise" && findings.length === 0) fail("revise 판정에는 findings가 하나 이상 있어야 합니다");
+	const { findings, blockers } = validateVerdict(input);
 	const criteria = input.criteria;
 	if (!criteria || typeof criteria !== "object" || Array.isArray(criteria)) fail('criteria가 필요합니다: { "AC-1": "ok|weak|fail", ... } 스펙의 모든 AC id를 넣으세요');
 	for (const c of state.spec.criteria) {
 		if (!["ok", "weak", "fail"].includes(criteria[c.id])) fail(`criteria.${c.id}는 ok, weak, fail 중 하나여야 합니다`);
 	}
 	const failedCriteria = state.spec.criteria.filter(c => criteria[c.id] === "fail").map(c => c.id);
-	const blockers = findings.filter(f => f?.severity === "blocker");
 	if (input.verdict === "pass" && failedCriteria.length) fail(`criteria에 fail(${failedCriteria.join(", ")})이 있으면 verdict는 revise여야 합니다`);
-	if (input.verdict === "pass" && blockers.length) fail("blocker 지적이 있으면 verdict는 revise여야 합니다");
+	if (input.verdict === "pass") {
+		const weakWithoutNote = state.spec.criteria.filter(c => criteria[c.id] === "weak" && !findings.some(f => f.target === c.id)).map(c => c.id);
+		if (weakWithoutNote.length) fail(`weak인 완료 기준(${weakWithoutNote.join(", ")})은 왜 약한지 findings에 그 AC를 target으로 적어야 pass로 받습니다. 끝내면 안 되는 수준이면 revise로`);
+	}
 
 	const round = ex.final_reviews.length + 1;
 	ex.final_reviews.push({ round, verdict: input.verdict, criteria, findings, summary: input.summary ?? null, at: new Date().toISOString() });
@@ -773,9 +986,10 @@ function cmdFinalReview(root, sid, flags) {
 		state.status = "stuck";
 		ex.failed_reason = `최종 리뷰 ${MAX_REVIEW_ROUNDS}회 뒤에도 revise`;
 	} else {
-		// 지적이 가리키는 작업은 다시 연다. 작업을 가리키지 않는 지적은 고친 뒤 verify부터 다시 한다. 증거는 무효로 돌린다.
-		reopened = [...new Set(findings.map(f => f?.target).filter(target => isText(target) && ex.tasks[target]))];
-		for (const id of reopened) reopenTask(state, id);
+		// blocker 지적이 가리키는 작업은 다시 연다 (의존 작업까지). 작업을 가리키지 않는 지적은 고친 뒤 verify부터 다시 한다. 증거는 무효로 돌린다.
+		const targets = [...new Set(blockers.flatMap(f => tasksForFinding(state.plan, f)))];
+		for (const id of targets) if (ex.tasks[id].status === "done") reopened.push(...reopenTask(state, id));
+		reopened = [...new Set(reopened)];
 		ex.criteria_evidence = null;
 	}
 	writeState(root, sid, state);
@@ -793,7 +1007,7 @@ function cmdFinalReview(root, sid, flags) {
 				: state.status === "stuck"
 					? "전체를 멈춥니다. 남은 지적을 사용자에게 보여주세요"
 					: reopened.length
-						? `다시 연 작업(${reopened.join(", ")})을 고치고 task-done으로 테스트를 다시 통과시킨 뒤 verify부터 다시 실행하세요`
+						? reopenNext(state, reopened)
 						: "지적을 고친 뒤 verify부터 다시 실행하세요. 작업을 고쳐야 하면 reopen --task <id>를 먼저 실행하세요",
 	};
 }
@@ -801,7 +1015,7 @@ function cmdFinalReview(root, sid, flags) {
 function cmdStatus(root, sid) {
 	const state = readState(root, sid);
 	if (!state) return { ok: true, exists: false };
-	return { ok: true, exists: true, ...summary(state), ...executionSummary(state), reviews: state.reviews, plan: state.plan, final_reviews: state.execution?.final_reviews ?? [] };
+	return { ok: true, exists: true, ...summary(state), ...executionSummary(state), reviews: state.reviews, plan: state.plan, amendments: state.amendments ?? [], final_reviews: state.execution?.final_reviews ?? [] };
 }
 
 const COMMANDS = {
@@ -813,6 +1027,7 @@ const COMMANDS = {
 	"task-done": cmdTaskDone,
 	"task-review": cmdTaskReview,
 	reopen: cmdReopen,
+	amend: cmdAmend,
 	verify: cmdVerify,
 	"final-review": cmdFinalReview,
 	status: cmdStatus,
@@ -829,7 +1044,10 @@ export function run(argv, cwd = process.cwd()) {
 
 if (process.argv[1]?.endsWith("build.mjs")) {
 	try {
-		process.stdout.write(`${JSON.stringify(run(process.argv.slice(2)), null, 2)}\n`);
+		const result = run(process.argv.slice(2));
+		process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+		// 기록은 됐지만 결과가 실패이거나 전체가 멈췄으면 종료 코드로도 알린다 (passed만 보고 지나치지 않게).
+		if (result.passed === false || result.status === "stuck") process.exit(2);
 	} catch (error) {
 		process.stdout.write(`${JSON.stringify({ ok: false, error: error.message }, null, 2)}\n`);
 		process.exit(1);

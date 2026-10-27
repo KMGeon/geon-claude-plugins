@@ -157,10 +157,66 @@ test("end: 정상 종료는 기준 통과 + 마지막 라운드 뒤 사용자 �
 	recordRound(root, 2, allYes(CORE_IDS));
 	assert.throws(() => cli(root, "end"), /사용자 답이 없습니다/);
 	say(root, "네, 이대로");
+	assert.throws(() => cli(root, "end"), /--spec/); // 정상 종료는 스펙 경로가 있어야 deep-build가 기록을 찾는다
+	assert.throws(() => cli(root, "end", "--spec", ".deep-interview/specs/deep-interview-x.md"), /스펙 파일이 없습니다/);
+	fs.mkdirSync(path.join(root, ".deep-interview/specs"), { recursive: true });
+	fs.writeFileSync(path.join(root, ".deep-interview/specs/deep-interview-x.md"), "# x\n");
 	const ended = cli(root, "end", "--spec", ".deep-interview/specs/deep-interview-x.md");
 	assert.equal(ended.ended, true);
 	assert.equal(ended.status, "done");
 	assert.equal(readState(root, SID).spec_path, ".deep-interview/specs/deep-interview-x.md");
+});
+
+test("record: 미룬 덩어리에는 라운드를 기록할 수 없다", () => {
+	const root = tempProject();
+	startWithScope(root, { components: [{ id: "app", name: "앱" }, { id: "later", name: "나중", status: "deferred" }] });
+	assert.throws(() => cli(root, "record", ...input({ round: 1, component: "later", dimension: "goal", question: "q", answer: "a", checks: { later: { g1: "근거" } } })), /미룬\(deferred\) 덩어리/);
+});
+
+test("record: 나중 라운드에서 같은 id로 고친 사실은 그 라운드 것이 되고, 뒤집힌 상태도 풀린다", () => {
+	const root = tempProject();
+	startWithScope(root);
+	recordRound(root, 1, allYes(CORE_IDS), { facts: [{ id: "f1", statement: "연 15일" }] });
+	recordRound(root, 2, allYes(CORE_IDS), { dispute: ["f1"] });
+	assert.equal(cli(root, "status").state.facts[0].status, "disputed");
+	const r3 = recordRound(root, 3, allYes(CORE_IDS), { facts: [{ id: "f1", statement: "연 20일" }] });
+	const f1 = cli(root, "status").state.facts[0];
+	assert.equal(f1.status, "active");
+	assert.equal(f1.round, 3);
+	assert.deepEqual(f1.history.map(h => h.statement), ["연 15일"]);
+	assert.equal(r3.floor, 0);
+	// 3라운드를 번복하면 그 사실이 뒤집힌다
+	const retracted = recordRound(root, 3, allYes(CORE_IDS), { answer: "아니요" });
+	assert.equal(retracted.retracted, true);
+	assert.equal(cli(root, "status").state.facts[0].status, "disputed");
+});
+
+test("record: 같은 답으로 같은 라운드를 다시 보내면(체크 정정) 그 라운드의 체크는 새로 보낸 것만 남는다", () => {
+	const root = tempProject();
+	startWithScope(root);
+	recordRound(root, 1, { g0: "근거", c1: false });
+	const r = recordRound(root, 1, { g0: "근거" });
+	assert.equal(r.retracted, false);
+	assert.deepEqual(Object.keys(cli(root, "status").state.checks.app), ["g0"]);
+});
+
+test("record: 기준을 통과한 라운드에서는 핵심 다시 묻기 신호를 내지 않는다", () => {
+	const root = tempProject();
+	startWithScope(root);
+	recordRound(root, 1, allYes(CORE_IDS));
+	recordRound(root, 2, allYes(CORE_IDS));
+	const r = recordRound(root, 3, allYes(CORE_IDS));
+	assert.equal(r.threshold_met, true);
+	assert.equal(r.rethink_core, false);
+});
+
+test("scope: 고정 항목에 덩어리(component)를 적을 수 있고, 없는 덩어리면 거부한다", () => {
+	const root = tempProject();
+	cli(root, "start");
+	say(root, "맞아요");
+	assert.throws(() => cli(root, "scope", ...input({ components: [{ id: "app", name: "앱" }], fixed_items: [{ id: "화면:x", statement: "x", component: "nope" }] })), /component는 덩어리 id/);
+	cli(root, "scope", ...input({ components: [{ id: "app", name: "앱" }], fixed_items: [{ id: "화면:x", statement: "x", component: "app" }] }));
+	assert.equal(cli(root, "status").state.fixed_items[0].component, "app");
 });
 
 test("end --status cancelled는 언제나 가능하고 기록은 남는다", () => {

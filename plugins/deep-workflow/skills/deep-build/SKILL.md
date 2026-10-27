@@ -33,26 +33,28 @@ node "${CLAUDE_SKILL_DIR}/scripts/build.mjs" <명령> --session ${CLAUDE_SESSION
 | `execute` | 구현 시작. 작업 수로 방식을 정하고 순서를 돌려준다 |
 | `task-done --task <id>` | 계획에 고정된 그 작업의 테스트 명령을 코드가 실행. 종료 코드 0이어야 완료 |
 | `task-review --task <id> --input @<경로>` | 에이전트 방식에서 리뷰 판정 기록 |
-| `reopen --task <id>` | 끝난 작업을 다시 연다. verify 실패나 최종 리뷰 revise 뒤 작업을 고칠 때 |
-| `verify` | 계획에 고정된 완료 기준별 증거 명령을 코드가 실행 |
+| `reopen --task <id>` | 끝난 작업을 (의존 작업까지) 다시 연다. verify 실패나 최종 리뷰 revise 뒤 작업을 고칠 때 |
+| `amend --input @<경로>` | 구현 중에 계획의 테스트·증거 명령만 고친다 (경로 오타 등). 고친 작업은 다시 열린다 |
+| `verify [--criterion <AC id>]` | 계획에 고정된 완료 기준별 증거 명령을 코드가 실행. 3회 실패면 stuck |
 | `final-review --input @<경로>` | 최종 리뷰 판정 기록. AC별 판정이 모두 있어야 한다 |
 | `status` | 현재 상태, 이어하기 |
 
-- 결과는 JSON. `"ok": false`면 `error`를 해결한다. 우회하지 않는다.
-- JSON 입력은 Write 도구로 프로젝트 밖 임시 폴더(`$TMPDIR`)에 쓰고 `@경로`로 넘긴다.
-- `task-done`·`verify`는 **긴 테스트가 끊기지 않게** Bash 도구의 `timeout`을 600000(10분)으로 준다.
-- `.deep-interview/sessions/`, `plans/`, `builds/`는 직접 쓰지 않는다 (훅이 막는다). 설계 문서(`.deep-interview/designs/`)는 직접 쓴다.
+- 결과는 JSON. `"ok": false`면 `error`를 해결한다. 우회하지 않는다. `"ok": true`여도 **`passed: false`나 `status: "stuck"`이면 실패**다(종료 코드 2). `passed`·`task_status`·`status`를 읽는다.
+- JSON 입력은 Write 도구로 프로젝트 밖 임시 폴더에 쓰고 `@경로`로 넘긴다. 경로는 `/tmp/deep-build-${CLAUDE_SESSION_ID}/<이름>.json`처럼 절대 경로로 쓴다(Write는 `$TMPDIR`을 풀지 않는다).
+- `task-done`·`verify`는 Bash 도구의 `timeout`을 600000(10분)으로 준다. 명령 하나는 코드가 8분에서 끊는다. 증거 명령이 여럿이고 길면 `verify --criterion AC-1`처럼 하나씩 실행한다. 그래도 넘칠 것 같으면 Bash `run_in_background`로 실행하고 결과를 기다린다.
+- `.deep-interview/sessions/`, `plans/`, `builds/`는 직접 쓰지 않는다 (훅이 막는다). 설계 문서(`.deep-interview/designs/`)는 직접 쓰되, 등록한 뒤에 바꾸면 `execute`가 거부하고 다시 등록·검토해야 한다.
 
 ## 흐름
 
 ### 1. 시작
 
-인자로 받은 스펙 경로로 `BD start --spec <경로>`를 실행한다.
+먼저 `BD status`를 본다. 이 세션에 빌드가 이미 있으면(`exists: true`) "이어하기"를 따른다. `done`/`stuck`이면 8절을 다시 보여주고 멈춘다. 새로 하려면 사용자가 그렇게 말했을 때만 `--restart`.
+
+없으면 인자로 받은 스펙 경로로 `BD start --spec <경로>`를 실행한다. 인자에 `--force`가 붙어 있으면(딥 인터뷰가 조기 종료 스펙을 넘긴 경우) 그대로 붙인다.
 
 - 결과의 `fixed_items`(고정 항목 ID)와 `criteria`(AC-1, AC-2… 와 문장)를 메모한다. 계획의 모든 작업은 이 ID들로 스펙과 연결된다. `warnings`가 있으면 사용자에게 한 줄 보여준다.
 - 오류에 "조기 종료된 스펙"이 나오면: 딥 인터뷰가 이미 사용자에게 물어봤고 진행하기로 한 경우에만 `--force`를 붙인다. 직접 불렸다면 스펙의 "남은 질문"과 미달 사실을 보여주고 AskUserQuestion으로 "그래도 진행할까요?"를 한 번 묻는다.
 - 오류에 "빠진 고정 항목"이 나오면 스펙 파일에 그 항목을 `- \`ID\` — 설명` 줄로 넣고 다시 시작한다. 인터뷰에서 확정한 것을 빌드가 모르고 지나가지 않게 하기 위해서다.
-- 오류에 "진행 중인 빌드"가 나오면 `BD status`로 보고 이어간다. 버리고 새로 시작하는 것은 사용자가 그렇게 말했을 때만 `--restart`.
 - 스펙 전체를 읽는다. 특히 **지킬 조건, 하지 않을 것, 다 됐다는 기준, 남은 질문, 코드에서 확인한 것**.
 - 기존 코드가 있으면 스펙의 "코드에서 확인한 것"에 적힌 파일을 Read/Grep으로 다시 본다.
 
@@ -160,7 +162,9 @@ JSON을 임시 파일에 쓰고 `BD plan --input @<경로>`를 실행한다. ID�
 
 ### 6. 작업 루프
 
-`BD execute`/`task-done`/`task-review` 결과의 `ready_tasks`가 지금 할 수 있는 작업들이다(의존이 끝난 것만, 코드가 가린다). 하나면 그것을, 여럿이면 `agents` 방식에서는 구현 에이전트를 동시에 띄워도 된다. 작업 사이에 사용자에게 "계속할까요?"를 묻지 않는다.
+`BD execute`/`task-done`/`task-review` 결과의 `ready_tasks`가 지금 할 수 있는 작업들이다(의존이 끝난 것만, 코드가 가린다). 하나면 그것을, 여럿이면 `agents` 방식에서는 구현 에이전트를 동시에 띄워도 된다. 단, 계획의 `files`가 겹치는 작업은 동시에 하지 않는다(같은 파일을 두 에이전트가 고친다). `task-done`은 한 번에 하나씩 실행한다. 작업 사이에 사용자에게 "계속할까요?"를 묻지 않는다.
+
+계획의 테스트 명령이나 증거 명령 자체가 틀렸으면(경로 오타, 패턴 불일치) 실패를 반복하지 말고 `BD amend --input @<경로>`로 그 명령만 고친다. 고친 작업은 다시 열린다. 다른 필드(파일, 인터페이스, 의존)를 고쳐야 하면 계획의 오류이므로 멈추고 사용자에게 알린다.
 
 **작업 하나의 순서 (`single`)**
 
@@ -178,16 +182,16 @@ JSON을 임시 파일에 쓰고 `BD plan --input @<경로>`를 실행한다. ID�
 4. 판정 JSON을 임시 파일에 쓰고 `BD task-review --task <id> --input @<경로>`로 기록한다. `revise`면 blocker를 구현 에이전트(같은 에이전트를 SendMessage로 이어가거나 새로 띄움)에게 넘겨 고치게 하고 2부터 다시. `revise`도 실패 횟수로 센다.
 5. 에이전트가 `blocked`를 돌려주면 추측으로 메우지 않는다. 막힌 이유가 스펙·계획의 빈 곳이면 `stuck`이 아니어도 멈추고 사용자에게 묻는다.
 
-**멈춤 (`stuck`)**: 끝난 작업, 남은 작업, 실패한 작업과 마지막 이유(`failed_reason`, `output_tail`)를 표로 보여주고 멈춘다. 고치려면 사용자가 정해야 하는 것을 한 줄로 적는다.
+**멈춤 (`stuck`)**: 끝난 작업, 남은 작업, 실패한 작업과 마지막 이유(`failed_reason`, `output_tail`)를 표로 보여주고 멈춘다. 고치려면 사용자가 정해야 하는 것을 한 줄로 적는다. 다시 하려면 사용자 결정 뒤 `BD start --spec <경로> --restart`로 설계부터 다시 한다(옛 상태는 `builds/`에 보관된다). 끝난 작업의 코드는 남아 있으니 설계·계획은 그것을 반영해 쓴다.
 
 ### 7. 완료 판정
 
 모든 작업이 `done`이면:
 
-1. `BD verify`를 실행한다. 코드가 계획의 `evidence` 명령을 완료 기준마다 실행하고 하나라도 0이 아니면 `passed: false`를 돌려준다.
-2. 실패한 기준이 있으면 고친다. 작업의 코드를 고쳐야 하면 `BD reopen --task <id>`로 그 작업을 다시 열고, 고친 뒤 `task-done`으로 테스트를 다시 통과시킨다. 그리고 `verify`를 다시 한다.
-3. 통과하면 새 에이전트에게 최종 리뷰를 맡긴다: `final-reviewer.md` 전문, 경로들, `verify` 결과(명령과 출력), 변경된 파일 목록(`git status`·`git diff --stat`). 읽기 전용이라고 명시한다.
-4. 판정을 `BD final-review --input @<경로>`로 기록한다. JSON에는 `criteria`(모든 AC의 ok/weak/fail)가 있어야 하고, fail이나 blocker가 있으면 pass일 수 없다(코드가 거부한다). `revise`면 코드가 지적의 `target`이 가리키는 작업을 자동으로 다시 연다(`reopened_tasks`). 그 작업을 고치고 `task-done` → `verify` → 다시 최종 리뷰. 최대 3회.
+1. `BD verify`를 실행한다. 코드가 계획의 `evidence` 명령을 완료 기준마다 실행하고 하나라도 0이 아니면 `passed: false`를 돌려준다. 실제 실패가 3회면 `stuck`.
+2. 실패한 기준이 있으면 고친다. 작업의 코드를 고쳐야 하면 `BD reopen --task <id>`로 그 작업을 다시 연다(의존 작업도 같이 열린다). 고친 뒤 `task-done`으로 테스트를 다시 통과시키고, `agents` 방식이면 `task-review`까지 받는다. 그리고 `verify`를 다시 한다. 명령 자체가 틀렸으면 `amend`.
+3. 통과하면 새 에이전트에게 최종 리뷰를 맡긴다: `final-reviewer.md` 전문, 경로들, `verify` 결과(명령과 출력), 변경된 파일 목록(`git status`·`git diff --stat`), `status` 결과의 `amendments`(구현 중 고친 명령). 읽기 전용이라고 명시한다.
+4. 판정을 `BD final-review --input @<경로>`로 기록한다. JSON에는 `criteria`(모든 AC의 ok/weak/fail)가 있어야 하고, fail이나 blocker가 있으면 pass일 수 없다(코드가 거부한다). `revise`면 코드가 blocker 지적이 가리키는 작업(`task`, 또는 `target`의 작업 id·AC id·파일 경로)을 의존 작업까지 자동으로 다시 연다(`reopened_tasks`). 그 작업을 고치고 `task-done`(+ `agents`면 `task-review`) → `verify` → 다시 최종 리뷰. 최대 3회.
 
 ### 8. 끝
 
@@ -214,5 +218,7 @@ JSON을 임시 파일에 쓰고 `BD plan --input @<경로>`를 실행한다. ID�
 ## 이어하기
 
 `BD status`로 상태를 본다. `designing`이면 2부터, `planning`이면 3부터, `reviewing`이면 4부터, `revising`이면 마지막 지적을 보고 2 또는 3부터, `planned`면 5부터, `executing`이면 `ready_tasks`·`awaiting_review_tasks`부터(둘 다 없으면 7부터), `done`/`stuck`이면 8을 다시 보여준다.
+
+세션이 바뀌어(`/clear` 등) `exists: false`가 나오는데 `.deep-interview/builds/`에 이전 세션 파일이 있으면, 그 파일 이름(세션 ID)으로 `--session <옛 ID>`를 붙여 이어갈 수 있다. 사용자에게 어느 빌드인지 확인하고 한다.
 
 인터뷰 스펙: $ARGUMENTS

@@ -96,6 +96,23 @@ test("다음 질문 제안: 점수 없는 곳 먼저, 비슷하면 방금 물은
 	assert.equal(next.unmet.length, 3);
 });
 
+test("다음 질문 제안: 기준을 아직 못 넘은 덩어리를 먼저 묻는다", () => {
+	// a는 성공 기준 한 항목이 낮지만 덩어리 모호도는 기준 이하. b는 전체적으로 아직 기준 위.
+	const state = {
+		type: "greenfield",
+		threshold: 0.2,
+		components: [{ id: "a" }, { id: "b" }],
+		checks: {
+			a: checks(["g0", "g1", "g2", "g3", "c1", "c2", "c3", "s1"], ["s2", "s3"]),
+			b: checks(["g0", "g1", "g2", "c1", "c2", "s1", "s2"], ["g3", "c3", "s3"]),
+		},
+		rounds: [{ component: "b" }],
+	};
+	const next = suggestNext(state);
+	assert.equal(evaluateState(state).lagging.includes("b"), true);
+	assert.equal(next.component, "b");
+});
+
 test("목표 항목은 '왜'(g0)를 포함하고, 다음 질문 제안에서 맨 앞에 나온다", () => {
 	const state = { type: "greenfield", components: [{ id: "a" }], checks: {}, rounds: [] };
 	const next = suggestNext(state);

@@ -230,7 +230,9 @@ function cmdScope(root, sid, flags) {
 
 	const fixedItems = (input.fixed_items ?? []).map(item => {
 		if (!isText(item?.id) || !isText(item?.statement)) fail("fixed_items의 항목마다 id와 statement가 필요합니다");
-		return { id: item.id, statement: item.statement };
+		// component(어느 덩어리의 것인지)는 선택. 적어 두면 그 덩어리를 미뤘을 때 deep-build가 이 항목을 요구하지 않는다.
+		if (item.component !== undefined && !ids.has(item.component)) fail(`fixed_items.${item.id}.component는 덩어리 id 중 하나여야 합니다: ${item.component}`);
+		return { id: item.id, statement: item.statement, ...(item.component !== undefined ? { component: item.component } : {}) };
 	});
 
 	if (input.type !== undefined) {
@@ -282,9 +284,10 @@ function applyFacts(state, input, roundNumber) {
 		if (!isText(fact?.id) || !isText(fact?.statement)) fail("facts의 항목마다 id와 statement가 필요합니다");
 		const existing = byId(fact.id);
 		if (existing) {
-			Object.assign(existing, { statement: fact.statement, evidence: fact.evidence ?? existing.evidence });
-			// 번복한 라운드에서 같은 id로 다시 보낸 사실은 새 답으로 다시 확정된 것이다.
-			if (existing.round === roundNumber && existing.status === "disputed") existing.status = "active";
+			// 같은 id로 다시 보낸 사실은 이번 라운드의 답으로 다시 확정된 것이다. 라운드도 이번 것으로 옮겨서,
+			// 이번 라운드를 번복하면 이 사실이 뒤집히고, 앞서 뒤집혔던 상태는 풀린다. 이전 문장은 history에 남긴다.
+			if (existing.statement !== fact.statement) existing.history = [...(existing.history ?? []), { statement: existing.statement, round: existing.round }];
+			Object.assign(existing, { statement: fact.statement, evidence: fact.evidence ?? existing.evidence, round: roundNumber, status: "active", superseded_by: null });
 		} else state.facts.push({ id: fact.id, statement: fact.statement, evidence: fact.evidence ?? null, round: roundNumber, status: "active", superseded_by: null });
 	}
 	for (const id of input.dispute ?? []) {
@@ -317,7 +320,9 @@ function cmdRecord(root, sid, flags) {
 	const previous = state.rounds.find(round => round.round === roundNumber);
 	if (!Number.isInteger(roundNumber) || roundNumber < 1) fail("round는 1 이상의 정수여야 합니다");
 	if (!previous && roundNumber !== lastRound + 1) fail(`다음 라운드 번호는 ${lastRound + 1}입니다`);
-	if (!state.components.some(component => component.id === input.component)) fail(`component는 덩어리 id 중 하나여야 합니다: ${input.component}`);
+	const component = state.components.find(c => c.id === input.component);
+	if (!component) fail(`component는 덩어리 id 중 하나여야 합니다: ${input.component}`);
+	if (component.status === "deferred") fail(`${input.component}는 미룬(deferred) 덩어리라 라운드를 기록할 수 없습니다. 다시 다루려면 사용자에게 확인받고 scope로 active로 바꾸세요`);
 	if (!dimensionsFor(state.type).includes(input.dimension)) fail(`dimension은 ${dimensionsFor(state.type).join(", ")} 중 하나여야 합니다`);
 	if (!isText(input.question) || !isText(input.answer)) fail("question과 answer가 필요합니다");
 	const source = input.answer_source ?? "user";
@@ -329,13 +334,16 @@ function cmdRecord(root, sid, flags) {
 	const before = state.current_ambiguity;
 	const beforeMilestone = state.milestone;
 	const retracted = previous && previous.answer !== input.answer;
-	if (retracted) {
-		for (const fact of state.facts) if (fact.round === roundNumber && fact.status === "active") fact.status = "disputed";
-		// 그 라운드에서 찍은 체크도 지운다. 번복된 답을 근거로 한 "예"가 점수에 남지 않게 하기 위해서다.
+	if (previous) {
+		// 같은 라운드를 다시 기록하면 그 라운드에서 찍은 체크는 일단 지운다 (번복이든 체크 정정이든).
 		// 이전 값은 복원하지 않고 "아직 답 안 함"으로 되돌린다 (점수가 낮아지는 쪽이 안전하다).
 		for (const answers of Object.values(state.checks)) {
 			for (const [checkId, check] of Object.entries(answers)) if (check.round === roundNumber) delete answers[checkId];
 		}
+	}
+	if (retracted) {
+		// 번복된 답을 근거로 한 사실은 뒤집힘으로 표시한다. 이번 요청의 facts에 같은 id가 있으면 applyFacts가 다시 active로 돌린다.
+		for (const fact of state.facts) if (fact.round === roundNumber && fact.status === "active") fact.status = "disputed";
 	}
 	applyChecks(state, input.checks, roundNumber);
 	applyFacts(state, input, roundNumber);
@@ -367,8 +375,13 @@ function cmdRecord(root, sid, flags) {
 
 	let autoStreak = 0;
 	for (let i = state.rounds.length - 1; i >= 0 && state.rounds[i].answer_source === "auto"; i -= 1) autoStreak += 1;
+	// 정체: 기준을 아직 못 넘었는데 최근 3라운드 동안 모호도가 거의 안 움직였거나, 덩어리 수에 비해 라운드가 많이 지났는데도 높다.
+	// 덩어리가 많으면 한 라운드에 전체 평균이 조금씩만 내려가므로 라운드 기준을 덩어리 수에 맞춘다.
+	const activeCount = state.components.filter(c => c.status !== "deferred").length;
 	const recent = state.rounds.slice(-3).map(round => round.ambiguity);
-	const stalled = (recent.length === 3 && Math.max(...recent) - Math.min(...recent) <= 0.05) || (roundNumber >= 8 && evaluation.ambiguity > 0.3);
+	const stalled =
+		!evaluation.threshold_met &&
+		((recent.length === 3 && Math.max(...recent) - Math.min(...recent) <= 0.05) || (roundNumber >= Math.max(8, 3 * activeCount) && evaluation.ambiguity > 0.3));
 
 	writeState(root, sid, state);
 	return {
@@ -428,6 +441,9 @@ function cmdEnd(root, sid, flags) {
 	if (wasActive && status === "done") {
 		const blocker = completionBlocker(root, sid, state);
 		if (blocker) fail(`아직 정상 종료할 수 없습니다: ${blocker} 사용자가 그만두기로 했다면 --status cancelled를 쓰세요.`);
+		// 정상 종료는 스펙 경로를 남겨야 한다. deep-build가 이 경로로 인터뷰 기록을 찾아 고정 항목·조기 종료를 대조한다.
+		if (!isText(flags.spec)) fail("정상 종료(done)에는 --spec <저장한 스펙 경로>가 필요합니다");
+		if (!fs.existsSync(path.resolve(root, flags.spec))) fail(`스펙 파일이 없습니다: ${flags.spec}. 먼저 스펙을 저장하세요`);
 	}
 	if (wasActive) {
 		state.active = false;

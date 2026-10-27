@@ -14,8 +14,8 @@
 
 ## 판정
 
-- `pass`: 모든 완료 기준이 증거로 뒷받침되고, 스펙을 어긴 곳이 없다.
-- `revise`: 완료 기준 중 증거가 약하거나 실제로 안 되는 것이 있다, 또는 스펙을 어겼다. 반드시 고칠 것만 `blocker`.
+- `pass`: 모든 완료 기준이 증거로 뒷받침되고, 스펙을 어긴 곳이 없다. 증거가 약한 기준(`weak`)이 있어도 끝내도 되는 수준이면 pass. 단, 그 AC를 `target`으로 한 `minor` 지적에 **왜 약한지**를 적어야 한다.
+- `revise`: 완료 기준 중 실제로 안 되는 것(`fail`)이 있거나, 약한 증거를 그대로 두면 안 되거나, 스펙을 어겼다. 반드시 고칠 것만 `blocker`.
 
 ## 응답 형식
 
@@ -26,10 +26,13 @@
   "verdict": "pass|revise",
   "criteria": { "AC-1": "ok|weak|fail", "AC-2": "ok" },
   "findings": [
-    { "id": "짧은-id", "target": "AC-n 또는 파일", "severity": "blocker|minor", "finding": "무엇이 문제인지.", "fix": "어떻게 고칠지 한 줄.", "evidence": "스펙 문장·증거·코드" }
+    { "id": "짧은-id", "task": "T2", "target": "AC-2", "severity": "blocker|minor", "finding": "무엇이 문제인지.", "fix": "어떻게 고칠지 한 줄.", "evidence": "스펙 문장·증거·코드" }
   ],
   "summary": "한 문장."
 }
 ```
 
-`criteria`에는 스펙의 모든 AC id를 넣는다. `fail`이 하나라도 있으면 verdict는 revise다. 지적은 최대 8개.
+- `criteria`에는 스펙의 모든 AC id를 넣는다. `fail`이 하나라도 있으면 verdict는 revise다.
+- `task`: 이 지적을 고치려면 다시 열어야 하는 **계획의 작업 id**. 코드는 blocker 지적의 `task`(없으면 `target`이 작업 id·AC id·파일 경로일 때 그것을 담당하는 작업)를 자동으로 다시 열어 테스트부터 다시 통과시킨다. 어느 작업인지 알 수 없으면 `null`.
+- `target`: 지적 대상. AC id, 파일 경로(`파일:줄` 가능), 작업 id 중 하나.
+- 지적은 최대 8개.

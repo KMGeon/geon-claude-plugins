@@ -64,7 +64,7 @@ function blockedMessage(reason, sessionId) {
 function protectedDir(abs) {
 	const parts = abs.split(path.sep);
 	const at = parts.lastIndexOf(".deep-interview");
-	return at >= 0 && parts[at + 1] in PROTECTED ? parts[at + 1] : null;
+	return at >= 0 && Object.hasOwn(PROTECTED, parts[at + 1]) ? parts[at + 1] : null;
 }
 
 /** 도구 호출을 판정한다. 막아야 하면 이유 문자열, 허용하면 null. */

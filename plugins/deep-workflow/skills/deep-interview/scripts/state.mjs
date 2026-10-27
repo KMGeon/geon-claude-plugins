@@ -311,6 +311,7 @@ export function componentProgress(state) {
  */
 export function suggestNext(state) {
 	const lastComponent = (state.rounds ?? []).at(-1)?.component ?? null;
+	const perComponent = componentAmbiguities(state);
 	const candidates = [];
 	for (const component of activeComponents(state)) {
 		const checks = state.checks?.[component.id] ?? {};
@@ -321,11 +322,12 @@ export function suggestNext(state) {
 			const unmet = Object.entries(CHECKLIST[dimension])
 				.filter(([id]) => checks[id]?.yes !== true)
 				.map(([id, text]) => `${id}: ${text}`);
-			candidates.push({ component: component.id, dimension, score, unmet });
+			candidates.push({ component: component.id, dimension, score, unmet, lagging: perComponent[component.id] > state.threshold });
 		}
 	}
 	if (candidates.length === 0) return null;
-	const rank = candidate => (candidate.score === null ? -1 : candidate.score) + (candidate.component === lastComponent ? 0.001 : 0);
+	// 기준을 아직 못 넘은 덩어리를 먼저, 그 안에서 점수 없는 항목 → 낮은 점수 순. 같으면 방금 물은 덩어리는 피한다.
+	const rank = candidate => (candidate.lagging ? 0 : 10) + (candidate.score === null ? -1 : candidate.score) + (candidate.component === lastComponent ? 0.001 : 0);
 	candidates.sort((a, b) => rank(a) - rank(b));
 	return candidates[0];
 }

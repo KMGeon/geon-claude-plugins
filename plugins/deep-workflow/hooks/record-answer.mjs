@@ -18,8 +18,9 @@ function buildRecord(input, now = new Date()) {
 	}
 	if (input?.tool_name === "AskUserQuestion") {
 		const questions = Array.isArray(input.tool_input?.questions) ? input.tool_input.questions : [];
-		const answers = [input.tool_response?.answers, input.tool_input?.answers].find(isObject) ?? {};
-		// 고른 답이 없으면(취소, 빈 응답) 기록하지 않는다. 빈 기록이 "사용자 확인"으로 세어지지 않게.
+		const raw = [input.tool_response?.answers, input.tool_input?.answers].find(isObject) ?? {};
+		// 고른 답이 없거나 전부 빈 문자열이면(취소, 빈 응답) 기록하지 않는다. 빈 기록이 "사용자 확인"으로 세어지지 않게.
+		const answers = Object.fromEntries(Object.entries(raw).filter(([, value]) => (typeof value === "string" ? value.trim().length > 0 : Boolean(value))));
 		if (Object.keys(answers).length === 0) return null;
 		return {
 			ts: now.toISOString(),
