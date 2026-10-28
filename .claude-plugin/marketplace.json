@@ -17,7 +17,7 @@
       "name": "mem0-self",
       "source": "./plugins/mem0-self",
       "description": "Mem0 공식 플러그인을 self-host Mem0 서버용으로 포크. 세션 기록을 self-host 서버에 기억으로 저장하고 다음 세션에서 불러옴",
-      "version": "0.1.0"
+      "version": "0.1.1"
     }
   ]
 }
