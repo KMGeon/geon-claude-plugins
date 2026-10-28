@@ -1960,7 +1960,10 @@ def _request_json_with_network_retry(
         return _request_json(url, key, payload, timeout)
     except urllib.error.HTTPError:
         raise
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except TimeoutError:
+        # A read timeout means the server is busy, not unreachable; retrying doubles the wait past hook limits.
+        raise
+    except (urllib.error.URLError, OSError):
         time.sleep(0.25)
         return _request_json(url, key, payload, timeout)
 

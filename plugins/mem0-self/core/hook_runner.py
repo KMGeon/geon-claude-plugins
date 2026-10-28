@@ -71,7 +71,9 @@ def first_prompt_memory_output(store: EvidenceStore, hook_input: dict) -> dict:
         return {}
     result = search_memories(
         store, repo, session_id, bounded(prompt, 6000),
-        top_k=5, operation="first-prompt-search", timeout=2,
+        # The self-host server reranks on CPU: prompts of 1,000+ chars take ~3.9s. One 4.5s attempt
+        # still fits the 6s UserPromptSubmit hook limit because read timeouts are not retried.
+        top_k=5, operation="first-prompt-search", timeout=4.5,
     )
     if not result.memories:
         return {}
