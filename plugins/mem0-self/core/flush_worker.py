@@ -16,10 +16,15 @@ from pathlib import Path
 import telemetry
 from memory_core import (
     EvidenceStore,
+    acquire_flush_slot,
     checkpoint_session,
     configure_harness,
+    lock_handoff,
     touch_handoff_heartbeat,
 )
+
+# Bounds concurrent requests to the self-host server across every session.
+MAX_CONCURRENT_FLUSHES = 2
 
 
 def main() -> int:
@@ -38,6 +43,8 @@ def main() -> int:
         )
         telemetry.init(harness=harness, source_tag=source_tag.upper())
     completed = False
+    handoff_lock = lock_handoff(handoff_path)
+    slot = None
     try:
         payload = json.loads(handoff_path.read_text(encoding="utf-8"))
         delay = float(payload.get("delay_seconds") or 0)
@@ -49,6 +56,10 @@ def main() -> int:
                 temporary.replace(handoff_path)
             finally:
                 temporary.unlink(missing_ok=True)
+            # The rewrite swapped in a new file, so the lock must follow it.
+            if handoff_lock is not None:
+                handoff_lock.close()
+            handoff_lock = lock_handoff(handoff_path)
             time.sleep(delay)
             if not handoff_path.exists():
                 return 0
@@ -71,6 +82,7 @@ def main() -> int:
                 ):
                     touch_handoff_heartbeat()
                     time.sleep(0.25)
+            slot = acquire_flush_slot(MAX_CONCURRENT_FLUSHES)
             # Hooks capture the conversation before handoff; the worker only flushes it.
             result = checkpoint_session(store, hook_input, reason)
             print(json.dumps(result, sort_keys=True), flush=True)
@@ -94,6 +106,9 @@ def main() -> int:
                 handoff_path.replace(handoff_path.with_suffix(".json"))
             except OSError:
                 pass
+        for handle in (slot, handoff_lock):
+            if handle is not None:
+                handle.close()
 
 
 if __name__ == "__main__":

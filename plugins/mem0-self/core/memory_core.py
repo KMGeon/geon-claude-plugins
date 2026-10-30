@@ -26,6 +26,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+try:
+    import fcntl
+except ImportError:  # Windows: liveness falls back to the handoff mtime.
+    fcntl = None
+
 import telemetry
 
 DEFAULT_API_URL = "http://localhost:8888"  # self-host Mem0 server default port
@@ -2012,6 +2017,58 @@ def touch_handoff_heartbeat() -> None:
         os.utime(path)
     except OSError:
         pass
+
+
+def lock_handoff(path: Path):
+    """Hold an exclusive lock on a handoff for the worker's lifetime.
+
+    mtime alone cannot tell a slow worker from a dead one: a worker sleeping
+    out its idle delay or blocked on a slow request looked stale and was
+    relaunched by every new session, piling duplicate flushes onto the server.
+    """
+    if fcntl is None:
+        return None
+    try:
+        handle = open(path, "rb")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return None
+    return handle
+
+
+def handoff_is_locked(path: Path) -> bool | None:
+    """True while a live worker holds the handoff; None where flock is unavailable."""
+    if fcntl is None:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
+
+
+def acquire_flush_slot(slots: int):
+    """Block until one of the machine-wide flush slots is free."""
+    if fcntl is None:
+        return None
+    directory = data_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    while True:
+        for index in range(slots):
+            handle = open(directory / f"flush-slot-{index}.lock", "a+b")
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                handle.close()
+                continue
+            return handle
+        touch_handoff_heartbeat()
+        time.sleep(1)
 
 
 def _wait_for_event(api_url: str, key: str, event_id: str) -> tuple[str, int, int]:
