@@ -24,6 +24,7 @@ from memory_core import (
     data_dir,
     detached_process_kwargs,
     format_context,
+    handoff_is_locked,
     harness_config,
     record_session_start,
     record_tool,
@@ -133,7 +134,11 @@ def recover_pending_handoffs() -> int:
     pending_dir = data_dir() / "pending"
     pending_dir.mkdir(parents=True, exist_ok=True)
     now = time.time()
+    alive = 0
     for running in pending_dir.glob("*.running"):
+        if handoff_is_locked(running):
+            alive += 1
+            continue
         try:
             if now - running.stat().st_mtime > STALE_RUNNING_SECONDS:
                 running.replace(running.with_suffix(".json"))
@@ -151,7 +156,7 @@ def recover_pending_handoffs() -> int:
         recoverable.append((age, handoff))
     recoverable.sort(key=lambda item: item[0], reverse=True)
     launched = 0
-    for _, handoff in recoverable[:PENDING_LAUNCH_LIMIT]:
+    for _, handoff in recoverable[:max(PENDING_LAUNCH_LIMIT - alive, 0)]:
         launched += int(_launch_handoff(handoff))
     return launched
 
