@@ -19,6 +19,7 @@
 - 2026-10-27: 플러그인 둘(deep-interview, deep-build)을 `plugins/deep-workflow` 하나로 합침. 스킬 두 개(`deep-interview`, `deep-build`)와 훅 한 벌. superpowers처럼 "플러그인 = 작업 흐름, 스킬 = 단계" 구조. 동작은 바뀌지 않음.
 - 2026-10-27: 네 에이전트(claude·codex·grok·antigravity) 리뷰 반영. deep-build: 테스트·증거 명령을 계획에 고정(task-done/verify가 명령을 받지 않음), 순환 의존은 plan에서 거부, 최종 리뷰 revise 시 작업 자동 reopen, criteria 판정 검사, start 덮어쓰기는 --restart로 분리, 인터뷰 기록과 고정 항목·조기 종료 대조, 결과 줄 정확 일치. deep-interview: 훅도 CLI와 같은 루트(git 최상위) 사용, 점수는 라운드를 넣은 뒤 계산, 안 물은 체크는 보내지 않음(SKILL), 범위 재확정에 새 답 필요, builds/ gitignore.
 - 2026-10-27: 2차 리뷰(같은 네 에이전트) 반영. deep-build: 최종 리뷰 지적의 task/target(작업·AC·파일)으로 작업을 찾아 의존 작업까지 reopen, reopen 시 시도 횟수 0부터, amend 명령(구현 중 명령만 수정), verify --criterion과 3회 실패 stuck, 설계 문서 해시 검사, 검토 세 종류 모두 blocker+pass 거부, weak는 지적 필요, 인터뷰 기록은 보관본·심볼릭 링크 경로까지 조회, 입력 검사 뒤에만 보관, build start도 gitignore, task-done은 쓰기 직전 상태 재읽기, 실패면 종료 코드 2. deep-interview: end --spec 필수, 미룬 덩어리 기록 거부, 같은 id 사실은 이번 라운드로, 같은 라운드 재기록 시 체크 정리, 기준 통과면 정체 신호 없음, 미달 덩어리 먼저 제안, 고정 항목 component, 빈 문자열 답 무시.
+- 2026-11-03: 설계 점검에서 재현된 빈틈 둘을 코드로 막음 (v0.2.1). (1) 세션 → 루트 색인(`lib/session-root.mjs`, `~/.claude/deep-workflow/sessions/<세션>.json`): 인터뷰·빌드가 진행 중이면 `cd`로 다른 저장소에 가도 훅과 상태 명령이 같은 루트를 봄. 끝난 뒤에는 cwd 기준으로 돌아가 다른 프로젝트에서 새로 시작할 수 있음. (2) 사용자 확인은 선택지 글자로 봄: `scope`는 `맞아요`, 스펙 저장·정상 종료는 `네, 이대로`를 선택지 창에서 고른 마지막 답이 있어야 함(" (추천)" 허용). 채팅 답·되물음·다른 선택지는 확인이 아님.
 
 ## 무엇을 만드나
 코드 작업을 시작하기 전에 사용자와 일대일로 인터뷰해서 요구사항의 빈 곳을 메우는 Claude Code 플러그인. 질문은 하나씩, 가장 흐릿한 곳부터 묻고, 점수로 진행 정도를 보여주며, 끝나면 스펙 파일 하나를 남기고 멈춘다.
@@ -61,8 +62,8 @@
 코드 수정 차단은 AI가 실수로 코드를 고치는 것을 막는 장치이고, 일부러 우회하는 것까지 막지는 않는다. 아래는 알고 남겨 둔 것이다.
 - Bash 우회: 셸 문법(`$'...'` 따옴표, zsh 확장), `git -c` 설정 주입, 환경 변수 앞붙이기, 읽기 명령의 쓰기·실행 옵션(`sed w`, `sort -o`, `tree -o`, `uniq`, `rg --pre`, `fd -x`, `git grep -O`), `>&파일`, 임시 폴더의 가짜 `scripts/interview.mjs`
 - 검사하지 않는 도구: MCP 쓰기 도구 등 Edit/Write/MultiEdit/NotebookEdit/Bash 밖의 도구
-- 차단이 풀리는 경우: 작업 위치가 프로젝트 밖일 때, 상태 파일이 깨지거나 다른 세션이 지웠을 때, 경로 대소문자를 바꿨을 때(macOS)
-- 설계상 한계: 체크 "예"의 근거 진위, 아무 메시지나 "사용자 확인"으로 셈, AI가 `end --status cancelled`로 스스로 해제 가능, `record` 동시 실행 시 유실 가능
+- 차단이 풀리는 경우: 상태 파일이 깨지거나 다른 세션이 지웠을 때, 경로 대소문자를 바꿨을 때(macOS). (작업 위치가 프로젝트 밖일 때 풀리던 것은 2026-11-03 세션 색인으로 해결)
+- 설계상 한계: 체크 "예"의 근거 진위, AI가 `end --status cancelled`로 스스로 해제 가능, `record` 동시 실행 시 유실 가능. (아무 메시지나 "사용자 확인"으로 세던 것은 2026-11-03 선택지 글자 확인으로 해결)
 
 같은 점검에서 고친 것: 답 번복 시 그 라운드 체크도 되돌림, `--quick`/`--deep` 뒤 단어 삼킴, 잘못된 `--type`이 기존 기록만 보관하던 순서, 상위 폴더 `.deep-interview` 우선, 답 원문 커밋 방지(`.deep-interview/.gitignore`에 `sessions/`).
 

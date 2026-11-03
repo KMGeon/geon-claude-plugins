@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkBashCommand } from "./bash-check.mjs";
-import { completionBlocker, isActive, projectRoot, readState, specsDir } from "../skills/deep-interview/scripts/state.mjs";
+import { completionBlocker, isActive, readState, resolveRoot, specsDir } from "../skills/deep-interview/scripts/state.mjs";
 
 // 파일을 직접 쓰는 도구.
 const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
@@ -84,8 +84,9 @@ export function evaluate(input) {
 	}
 
 	if (typeof sessionId !== "string") return null;
-	// 인터뷰 CLI와 같은 규칙으로 루트를 정한다 (git 최상위 우선). 다르게 정하면 CLI가 쓴 상태를 훅이 못 본다.
-	const root = projectRoot(cwd);
+	// 인터뷰 CLI와 같은 규칙으로 루트를 정한다: 이 세션의 진행 중인 인터뷰·빌드가 있는 루트(세션 색인) → cwd의 git 최상위.
+	// cwd만 보면 `cd`로 다른 저장소에 간 순간 차단이 풀린다.
+	const root = resolveRoot(sessionId, cwd);
 
 	// 이 세션의 인터뷰만 본다. 다른 세션의 인터뷰는 이 세션을 막지 않는다.
 	let state = null;

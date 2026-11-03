@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
 	CHECK_DIMENSION,
+	CONFIRM_LABELS,
 	DIR_NAME,
 	DIMENSION_NAMES,
 	EARLY_EXIT_MIN_ROUNDS,
@@ -28,12 +29,15 @@ import {
 	isActive,
 	milestoneFor,
 	overallScores,
+	pickedLabel,
 	projectRoot,
 	readAnswers,
 	readState,
+	resolveRoot,
 	round2,
 	statePath,
 	suggestNext,
+	writeSessionIndex,
 	writeState,
 } from "./state.mjs";
 
@@ -157,7 +161,10 @@ function ensureGitignore(root) {
 /** 인터뷰를 시작한다. 같은 세션에 끝난 인터뷰가 있으면 이름을 바꿔 보관하고 새로 만든다. */
 function cmdStart(root, sid, flags) {
 	const existing = readState(root, sid);
-	if (isActive(existing)) return { ok: true, already_active: true, ...summary(root, sid, existing) };
+	if (isActive(existing)) {
+		writeSessionIndex(sid, root); // 색인이 없던 세션(이전 버전)도 이제부터 cwd와 무관하게 같은 루트를 보게 한다.
+		return { ok: true, already_active: true, ...summary(root, sid, existing) };
+	}
 	// 입력 검사를 먼저 한다. 잘못된 입력 때문에 기존 기록만 보관되고 새 상태가 없는 일을 막는다.
 	const type = flags.type ?? "greenfield";
 	if (!(type in WEIGHTS)) fail('--type은 "greenfield" 또는 "brownfield"여야 합니다');
@@ -194,6 +201,8 @@ function cmdStart(root, sid, flags) {
 		answers_at_start: readAnswers(root, sid).length,
 	};
 	writeState(root, sid, state);
+	// 세션 → 루트 색인. 인터뷰가 진행 중인 동안 cwd가 바뀌어도(cd) 훅과 명령이 이 루트를 본다.
+	writeSessionIndex(sid, root);
 	return {
 		ok: true,
 		already_active: false,
@@ -202,14 +211,19 @@ function cmdStart(root, sid, flags) {
 	};
 }
 
-/** Round 0 결과(덩어리, 고정 항목)를 저장한다. 처음이든 다시 잡든, 직전 범위 확정 뒤에 사용자가 한 번은 답해야 한다. */
+/** Round 0 결과(덩어리, 고정 항목)를 저장한다. 처음이든 다시 잡든, 직전 범위 확정 뒤에 사용자가 선택지 창에서 "맞아요"를 골라야 한다. */
 function cmdScope(root, sid, flags) {
 	const state = requireActive(root, sid);
 	const input = readInput(flags);
 	// 답 개수로 본다 (같은 순간에 기록돼도 정확함). 다시 잡을 때는 직전 scope 이후의 답이어야 한다.
-	const answersNow = readAnswers(root, sid).length;
-	if (!(answersNow > (state.answers_at_scope ?? state.answers_at_start ?? 0))) {
-		fail("사용자가 범위 확인에 답한 기록이 없습니다. 덩어리 목록을 보여주고 사용자 답을 받은 뒤 다시 실행하세요");
+	// 그 마지막 답은 선택지 창에서 "맞아요"를 고른 것이어야 한다. 되물음이나 "덩어리 고치기"가 확정으로 세어지지 않게.
+	const answers = readAnswers(root, sid);
+	const answersNow = answers.length;
+	const last = answersNow > (state.answers_at_scope ?? state.answers_at_start ?? 0) ? answers.at(-1) : null;
+	if (!pickedLabel(last, CONFIRM_LABELS.scope)) {
+		fail(
+			`사용자가 선택지 창에서 "${CONFIRM_LABELS.scope}"를 골라 범위를 확인한 기록이 없습니다. 덩어리 표와 고정 항목을 보여주고 AskUserQuestion(선택지 "${CONFIRM_LABELS.scope}", "덩어리 고치기", "일부는 나중에")으로 확인받은 뒤 다시 실행하세요. 채팅으로 답했거나 되물었으면 선택지로 한 번 더 확인받으세요`,
+		);
 	}
 
 	if (!Array.isArray(input.components) || input.components.length === 0) fail("components에 덩어리가 하나 이상 있어야 합니다");
@@ -463,7 +477,8 @@ export function run(argv, cwd = process.cwd()) {
 	const handler = COMMANDS[command];
 	if (!handler) fail(`알 수 없는 명령입니다: ${JSON.stringify(command)}. 가능한 명령: ${Object.keys(COMMANDS).join(", ")}`);
 	if (!isText(flags.session)) fail("--session이 필요합니다");
-	const root = projectRoot(isText(flags.root) ? flags.root : cwd);
+	// --root가 없으면 세션 색인을 먼저 본다: 이 세션의 진행 중인 인터뷰·빌드가 있는 루트면 cwd가 바뀌었어도 그 루트를 쓴다.
+	const root = isText(flags.root) ? projectRoot(flags.root) : resolveRoot(flags.session, cwd);
 	return handler(root, flags.session, flags);
 }
 
