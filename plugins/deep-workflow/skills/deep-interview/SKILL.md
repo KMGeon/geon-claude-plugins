@@ -1,7 +1,7 @@
 ---
 name: deep-interview
 description: 코드를 쓰기 전에 사용자와 일대일 인터뷰를 해서 요구사항의 빈 곳을 메운다. 질문은 한 번에 하나, 가장 흐릿한 부분부터 묻고, 매번 코드가 계산한 모호도 점수를 보여준다. 점수가 기준 아래로 내려오면 스펙 파일을 남기고 끝낸다. "인터뷰해줘", "요구사항 정리", "다 물어봐", "추측하지 마", "deep interview" 같은 요청이나, 무엇을 만들지 흐릿한 구현 요청에 쓴다.
-argument-hint: "[--quick|--deep] <만들고 싶은 것>"
+argument-hint: "[--quick|--deep] [--goal|--build] <만들고 싶은 것>"
 ---
 
 # 딥 인터뷰
@@ -50,7 +50,7 @@ node "${CLAUDE_SKILL_DIR}/scripts/interview.mjs" <명령> --session ${CLAUDE_SES
 5. **필요 없으면 하지 않는다.** 이미 분명하고 작은 요청이면 인터뷰 없이 바로 처리하자고 제안한다.
 6. **사람과 하는 인터뷰다.** `record`가 `must_ask_user: true`를 돌려주면 다음 질문은 꼭 사용자에게 직접 한다.
 7. **인터뷰하는 동안 코드는 건드리지 않는다.** 사용자가 "구현"이라는 말을 써도 그건 최종 목적지를 말한 것이지 지금 만들라는 뜻이 아니다. 훅이 막으면 우회하지 말고, 사용자가 그만두겠다고 했을 때만 `end --status cancelled`를 쓴다.
-8. **스펙을 저장하면 다음 단계로 넘긴다.** 기준을 통과한 스펙은 같은 플러그인의 `deep-build` 스킬에 바로 넘기고, 조기 종료 스펙은 사용자에게 한 번 묻는다.
+8. **스펙을 저장하면 다음 단계로 넘긴다.** 기준을 통과한 스펙은 같은 플러그인의 `deep-goal`(`/goal` 조건으로 구현) 또는 `deep-build`(설계·계획·검토 뒤 구현)로 넘긴다. 어느 쪽인지는 시작 인자 `--goal`/`--build`로 정해졌으면 그대로, 아니면 스펙 저장 뒤 한 번 묻는다. 조기 종료 스펙은 넘기기 전에 사용자에게 한 번 묻는다.
 
 ## 화면에 보이는 것
 
@@ -329,13 +329,20 @@ IV record --input '{"round":1,"component":"apply","dimension":"goal","question":
 
 `end`가 끝난 뒤(차단이 풀린 뒤)에 한다.
 
+**어느 길로 갈지.** 두 길이 있다. 시작 인자에 `--goal`이나 `--build`가 있었으면 묻지 않고 그 길로 간다. 없으면 스펙을 저장한 뒤 AskUserQuestion으로 **한 번** 묻는다 (header: `다음 단계`). 완료 기준이 4개 이하이고 덩어리가 2개 이하면 `/goal` 선택지를 첫 번째(추천)에, 아니면 `deep-build`를 첫 번째에 둔다.
+
+| 길 | 선택지 글 | 맞는 경우 |
+|:---|:---|:---|
+| `deep-goal` | `/goal로 바로 구현` | 스펙이 작고 분명해서 설계 문서가 필요 없을 때. Claude Code `/goal`이 조건 충족까지 세션을 붙잡고, 평가자가 매 턴 판정 |
+| `deep-build` | `deep-build로 설계·계획부터` | 덩어리가 여럿이거나 구조를 정해야 할 때. 코드가 계획 연결·테스트·증거를 검사 |
+
 | 스펙 결과 | 할 일 |
 |:---|:---|
-| 기준 통과 | Skill 도구로 deep-build를 부른다. 인자는 스펙 경로. 예: `Skill(skill: "deep-workflow:deep-build", args: ".deep-interview/specs/deep-interview-leave-request.md")`. 스킬 목록에 `deep-workflow:deep-build`가 없고 `deep-build`만 있으면 그 이름으로 |
-| 조기 종료 (기준 미달) | 스펙의 "남은 질문"과 미달 사실을 보여주고 AskUserQuestion으로 "그래도 설계·계획으로 넘어갈까요?"를 **한 번** 묻는다. 선택지: `넘어가기`, `여기서 멈추기`. 넘어가면 인자에 ` --force`를 붙여 부르고, 멈추면 끝 |
+| 기준 통과 | Skill 도구로 고른 스킬을 부른다. 인자는 스펙 경로. 예: `Skill(skill: "deep-workflow:deep-goal", args: ".deep-interview/specs/deep-interview-leave-request.md")` 또는 `Skill(skill: "deep-workflow:deep-build", args: "...")`. 스킬 목록에 `deep-workflow:` 접두사가 없으면 `deep-goal`/`deep-build` 이름으로 |
+| 조기 종료 (기준 미달) | 스펙의 "남은 질문"과 미달 사실을 보여주고 AskUserQuestion으로 "그래도 다음 단계로 넘어갈까요?"를 **한 번** 묻는다. 선택지: `넘어가기`, `여기서 멈추기`. 넘어가면 위 길 선택을 거쳐 인자에 ` --force`를 붙여 부르고, 멈추면 끝 |
 | 취소 (`--status cancelled`) | 스펙이 없으므로 넘기지 않는다 |
 
-`deep-build`는 같은 플러그인(deep-workflow)에 들어 있다. 어떤 이유로든 부를 수 없으면 스펙 경로와 `/deep-build <경로>` 명령을 보여주고 멈춘다. 딥 인터뷰는 단독으로도 쓸 수 있어야 한다.
+`deep-goal`과 `deep-build`는 같은 플러그인(deep-workflow)에 들어 있다. 어떤 이유로든 부를 수 없으면 스펙 경로와 `/deep-goal <경로>` 또는 `/deep-build <경로>` 명령을 보여주고 멈춘다. 딥 인터뷰는 단독으로도 쓸 수 있어야 한다. `deep-goal`은 `/goal` 한 줄을 사용자가 붙여 넣어야 목표가 걸린다 (스킬이 내장 명령을 대신 부를 수 없다).
 
 ## 이어하기
 
@@ -387,6 +394,6 @@ Round 3 | 승인 | 제약 | 모호도: 48%
 - [ ] 한 번 더 의심하기와 한 문장 맞춰 보기를 거쳤다
 - [ ] 스펙을 저장했고 고정 항목이 다 들어 있다
 - [ ] `end`로 인터뷰를 끝냈다 (그만둘 때는 `--status cancelled`)
-- [ ] 기준 통과면 `deep-build`로 넘겼고, 조기 종료면 한 번 물었다
+- [ ] 기준 통과면 `--goal`/`--build` 또는 한 번의 질문으로 길을 정해 `deep-goal`/`deep-build`로 넘겼고, 조기 종료면 한 번 물었다
 
 인터뷰 주제: $ARGUMENTS

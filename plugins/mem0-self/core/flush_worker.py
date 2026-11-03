@@ -79,10 +79,12 @@ def main() -> int:
                 while (
                     store.has_inflight_flush(repo.identity, session_id)
                     and time.monotonic() < deadline
+                    and not store.is_paused()
                 ):
                     touch_handoff_heartbeat()
                     time.sleep(0.25)
-            slot = acquire_flush_slot(MAX_CONCURRENT_FLUSHES)
+            if not store.is_paused():
+                slot = acquire_flush_slot(MAX_CONCURRENT_FLUSHES)
             # Hooks capture the conversation before handoff; the worker only flushes it.
             result = checkpoint_session(store, hook_input, reason)
             print(json.dumps(result, sort_keys=True), flush=True)

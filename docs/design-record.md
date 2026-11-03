@@ -194,7 +194,7 @@
 | 10 (최종) | 7 | - | - | 7 | - |
 
 ## 문답 기록
-<details>
+<details open>
 <summary>11 라운드</summary>
 
 ### Round 0

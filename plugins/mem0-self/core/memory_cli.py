@@ -116,10 +116,12 @@ def main() -> int:
             return 0 if result["ok"] else 1
         elif args.command == "pause":
             store.set_setting("paused", "true")
-            print("Mem0 stopped saving and searching memories.")
+            print("Mem0 paused memory capture. Existing memories remain searchable.")
         elif args.command == "resume":
-            store.set_setting("paused", "false")
-            print("Mem0 resumed saving and searching memories.")
+            store.resume_capture()
+            from hook_runner import recover_pending_handoffs
+            recover_pending_handoffs()
+            print("Mem0 resumed memory capture.")
         elif args.command == "forget":
             if not args.yes:
                 print(
