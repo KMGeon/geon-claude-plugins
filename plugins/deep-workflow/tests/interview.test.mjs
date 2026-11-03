@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { CORE_IDS, SID, allYes, cli, input, recordRound, say, startWithScope, tempProject } from "./helpers.mjs";
+import { CORE_IDS, SID, allYes, choose, cli, confirmScope, confirmSpec, input, recordRound, say, startWithScope, tempProject } from "./helpers.mjs";
 import { readState, sessionDir } from "../skills/deep-interview/scripts/state.mjs";
 import { run } from "../skills/deep-interview/scripts/interview.mjs";
 
@@ -24,12 +24,17 @@ test("start: 진행 중이면 그대로 이어가고, 끝난 인터뷰는 보관
 	assert.ok(fs.readdirSync(sessionDir(root, SID)).some(name => /^state-.+\.json$/.test(name)));
 });
 
-test("scope: 시작 후 사용자 답이 기록돼 있어야 한다", () => {
+test("scope: 사용자가 선택지 창에서 '맞아요'를 골라야 한다", () => {
 	const root = tempProject();
 	cli(root, "start");
 	const scope = input({ components: [{ id: "app", name: "앱" }] });
-	assert.throws(() => cli(root, "scope", ...scope), /사용자가 범위 확인에 답한 기록이 없습니다/);
+	assert.throws(() => cli(root, "scope", ...scope), /"맞아요"를 골라 범위를 확인한 기록이 없습니다/);
+	// 채팅 답, 되물음, 다른 선택지는 확정이 아니다. " (추천)"이 붙은 선택지는 받는다.
 	say(root, "맞아요");
+	assert.throws(() => cli(root, "scope", ...scope), /"맞아요"를 골라/);
+	choose(root, "범위 확인", "덩어리 고치기");
+	assert.throws(() => cli(root, "scope", ...scope), /"맞아요"를 골라/);
+	confirmScope(root);
 	assert.equal(cli(root, "scope", ...scope).scope_confirmed, true);
 });
 
@@ -37,10 +42,10 @@ test("scope: 기록이 있는 덩어리는 지울 수 없고 미루기만 된다
 	const root = tempProject();
 	startWithScope(root);
 	recordRound(root, 1, { g1: "근거" });
-	// 범위를 다시 잡으려면 직전 범위 확정 뒤에 사용자 답이 있어야 한다.
+	// 범위를 다시 잡으려면 직전 범위 확정 뒤에 사용자가 다시 "맞아요"를 골라야 한다.
 	const rescope = input({ components: [{ id: "app", name: "앱", status: "deferred" }, { id: "other", name: "다른 것" }] });
-	assert.throws(() => cli(root, "scope", ...rescope), /답한 기록이 없습니다/);
-	say(root, "네, 범위를 바꿔요");
+	assert.throws(() => cli(root, "scope", ...rescope), /"맞아요"를 골라/);
+	confirmScope(root);
 	assert.throws(() => cli(root, "scope", ...input({ components: [{ id: "other", name: "다른 것" }] })), /지울 수 없습니다/);
 	assert.throws(() => cli(root, "scope", ...input({ components: [{ id: "app", name: "앱", status: "deferred" }] })), /active.*하나 이상/);
 	cli(root, "scope", ...rescope);
@@ -155,8 +160,10 @@ test("end: 정상 종료는 기준 통과 + 마지막 라운드 뒤 사용자 �
 	recordRound(root, 1, { g1: "근거" });
 	assert.throws(() => cli(root, "end"), /기준값/);
 	recordRound(root, 2, allYes(CORE_IDS));
-	assert.throws(() => cli(root, "end"), /사용자 답이 없습니다/);
-	say(root, "네, 이대로");
+	assert.throws(() => cli(root, "end"), /"네, 이대로"를 고른 기록이 없습니다/);
+	say(root, "네, 이대로"); // 채팅 답은 확인이 아니다
+	assert.throws(() => cli(root, "end"), /"네, 이대로"를 고른 기록이 없습니다/);
+	confirmSpec(root);
 	assert.throws(() => cli(root, "end"), /--spec/); // 정상 종료는 스펙 경로가 있어야 deep-build가 기록을 찾는다
 	assert.throws(() => cli(root, "end", "--spec", ".deep-interview/specs/deep-interview-x.md"), /스펙 파일이 없습니다/);
 	fs.mkdirSync(path.join(root, ".deep-interview/specs"), { recursive: true });
@@ -213,7 +220,7 @@ test("record: 기준을 통과한 라운드에서는 핵심 다시 묻기 신호
 test("scope: 고정 항목에 덩어리(component)를 적을 수 있고, 없는 덩어리면 거부한다", () => {
 	const root = tempProject();
 	cli(root, "start");
-	say(root, "맞아요");
+	confirmScope(root);
 	assert.throws(() => cli(root, "scope", ...input({ components: [{ id: "app", name: "앱" }], fixed_items: [{ id: "화면:x", statement: "x", component: "nope" }] })), /component는 덩어리 id/);
 	cli(root, "scope", ...input({ components: [{ id: "app", name: "앱" }], fixed_items: [{ id: "화면:x", statement: "x", component: "app" }] }));
 	assert.equal(cli(root, "status").state.fixed_items[0].component, "app");

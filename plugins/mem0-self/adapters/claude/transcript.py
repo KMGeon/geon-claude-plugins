@@ -319,6 +319,13 @@ def transcript_extraction_messages(
     return output, leaf_uuid, end_offset
 
 
+def record_paused(store: EvidenceStore, hook_input: dict[str, Any]) -> None:
+    """Advance only the byte boundary while capture is paused."""
+    store.skip_paused_transcript(
+        _session_id(hook_input), str(hook_input.get("transcript_path") or "")
+    )
+
+
 def record_stop(
     store: EvidenceStore, hook_input: dict[str, Any]
 ) -> tuple[RepoContext, str]:
@@ -337,6 +344,19 @@ def record_stop(
         and str(previous_stop.get("transcript_path") or "") == transcript_path
         else 0
     )
+    skip_bytes = store.transcript_skip_bytes(session_id, transcript_path)
+    if skip_bytes:
+        try:
+            size = Path(transcript_path).expanduser().stat().st_size
+            if start_offset > size:
+                start_offset = 0
+            if skip_bytes > size:
+                # A rewritten transcript must not rewind into a private segment.
+                store.skip_paused_transcript(session_id, transcript_path)
+                skip_bytes = size
+        except OSError:
+            return repo, session_id
+        start_offset = max(start_offset, skip_bytes)
     transcript_messages, leaf_uuid, end_offset = transcript_extraction_messages(
         transcript_path,
         session_id,

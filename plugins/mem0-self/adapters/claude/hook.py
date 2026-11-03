@@ -20,7 +20,7 @@ from memory_core import (  # noqa: E402
     record_subagent_stop,
     record_tool,
 )
-from transcript import record_stop  # noqa: E402
+from transcript import record_paused, record_stop  # noqa: E402
 
 configure_harness("claude-code", data_dir_name="claude-code-plugin", source_tag="claude_code_plugin")
 telemetry.init(harness="claude-code", source_tag="CLAUDE_CODE_PLUGIN")
@@ -44,6 +44,7 @@ def _sidekick_stop(store, hook_input):
 if __name__ == "__main__":
     hook_runner.entry_point(
         record_stop_fn=record_stop,
+        record_paused_fn=record_paused,
         extra_actions={
             "post-tool-failure": lambda s, h: record_tool(s, h, failed=True),
             "sidekick-start": _sidekick_start,

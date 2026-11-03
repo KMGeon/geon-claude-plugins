@@ -8,6 +8,7 @@ The agent can search those memories during later work in the repository.
 
 from __future__ import annotations
 
+import errno
 import functools
 import hashlib
 import json
@@ -21,6 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -688,6 +690,13 @@ class EvidenceStore:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS paused_transcripts (
+                session_id TEXT NOT NULL,
+                transcript_path TEXT NOT NULL,
+                skip_bytes INTEGER NOT NULL,
+                PRIMARY KEY(session_id, transcript_path)
+            );
+
             """
         )
         # Remove the pre-0.1.1 snapshot implementation.
@@ -1208,6 +1217,50 @@ class EvidenceStore:
             "on",
         }
 
+    def skip_paused_transcript(self, session_id: str, transcript_path: str) -> None:
+        """Remember a byte boundary without reading or storing paused content."""
+        if not transcript_path:
+            return
+        try:
+            size = Path(transcript_path).expanduser().stat().st_size
+        except OSError:
+            size = 0
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO paused_transcripts VALUES (?, ?, ?)
+                   ON CONFLICT(session_id, transcript_path) DO UPDATE SET
+                     skip_bytes = excluded.skip_bytes""",
+                (session_id, transcript_path, size),
+            )
+
+    def transcript_skip_bytes(self, session_id: str, transcript_path: str) -> int:
+        row = self.conn.execute(
+            "SELECT skip_bytes FROM paused_transcripts WHERE session_id = ? AND transcript_path = ?",
+            (session_id, transcript_path),
+        ).fetchone()
+        return int(row["skip_bytes"]) if row else 0
+
+    def resume_capture(self) -> None:
+        """Skip everything written before resume, including late transcript rows."""
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            if not self.is_paused():
+                return
+            for row in self.conn.execute("SELECT session_id, transcript_path FROM paused_transcripts").fetchall():
+                try:
+                    size = Path(row["transcript_path"]).expanduser().stat().st_size
+                except OSError:
+                    continue
+                self.conn.execute(
+                    "UPDATE paused_transcripts SET skip_bytes = ? WHERE session_id = ? AND transcript_path = ?",
+                    (size, row["session_id"], row["transcript_path"]),
+                )
+            self.conn.execute(
+                """INSERT INTO settings VALUES ('paused', 'false', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+                (utc_now(),),
+            )
+
     def forget_local_repo(self, repo_id: str) -> dict[str, int]:
         tables = {
             "events": "repo_id",
@@ -1219,6 +1272,10 @@ class EvidenceStore:
         }
         removed: dict[str, int] = {}
         with self.conn:
+            self.conn.execute(
+                "DELETE FROM paused_transcripts WHERE session_id IN (SELECT session_id FROM session_scopes WHERE repo_id = ?)",
+                (repo_id,),
+            )
             for table, column in tables.items():
                 cursor = self.conn.execute(
                     f"DELETE FROM {table} WHERE {column} = ?", (repo_id,)
@@ -1872,7 +1929,8 @@ def _oss_memory_matches(memory: dict[str, Any], leaves: dict[str, list[Any]]) ->
     for run_id in leaves.get("run_id", []):
         if run_id and meta.get("session_id") != run_id:
             return False
-    for cond in leaves.get("metadata", []):
+    # Directory scope narrows project facts, not the user's personal preferences.
+    for cond in leaves.get("metadata", []) if memory.get("agent_id") else []:
         dirs = (cond or {}).get("dirs", {}).get("contains") if isinstance(cond, dict) else None
         if dirs and dirs not in (meta.get("dirs") or []):
             return False
@@ -1922,13 +1980,50 @@ def _oss_search(base: str, key: str, payload: dict[str, Any], timeout: float):
     _filter_leaves(payload.get("filters") or {}, leaves)
     user = next((str(v) for v in leaves.get("user_id", []) if v), "") or user_id()
     top_k = int(payload.get("top_k") or 3)
-    body = {"query": payload.get("query", ""), "filters": {"user_id": user}, "top_k": max(top_k * 4, 20)}
+    body = {"query": payload.get("query", ""), "top_k": max(top_k * 4, 20)}
+    if "rerank" in payload:
+        body["rerank"] = payload["rerank"]
     if payload.get("threshold") is not None:
         body["threshold"] = payload["threshold"]
-    parsed, req_chars, resp_chars = _oss_http("POST", f"{base}/search", key, body, timeout)
-    items = parsed.get("results", []) if isinstance(parsed, dict) else parsed
-    kept = [m for m in items if isinstance(m, dict) and _oss_memory_matches(m, leaves)][:top_k]
-    return {"results": kept}, req_chars, resp_chars
+    project_ids = list(dict.fromkeys(str(v) for v in leaves.get("agent_id", []) if v))
+    # Retrieve each repository before top-k truncation. Keep the existing personal
+    # lane, but never let its unrelated repository hits crowd out project facts.
+    filters = [{"user_id": user, "agent_id": project_id} for project_id in project_ids]
+    filters.append({"user_id": user})
+    for scope in filters:
+        for run_id in leaves.get("run_id", []):
+            if run_id:
+                scope["session_id"] = run_id  # _oss_add stores it in metadata
+        for condition in leaves.get("categories", []):
+            if isinstance(condition, dict) and condition.get("contains"):
+                scope["categories"] = condition["contains"]
+        if scope.get("agent_id"):
+            for condition in leaves.get("metadata", []):
+                directory = (condition or {}).get("dirs", {}).get("contains")
+                if directory:
+                    scope["dirs"] = directory
+
+    def search(scope):
+        return _oss_http("POST", f"{base}/search", key, {**body, "filters": scope}, timeout)
+
+    # One hook timeout budget: do not serialize two potentially slow searches.
+    with ThreadPoolExecutor(max_workers=len(filters)) as pool:
+        responses = list(pool.map(search, filters))
+    kept = {}
+    req_total = resp_total = 0
+    for scope, (parsed, req_chars, resp_chars) in zip(filters, responses):
+        req_total += req_chars
+        resp_total += resp_chars
+        items = parsed.get("results", []) if isinstance(parsed, dict) else parsed
+        for memory in items:
+            if not isinstance(memory, dict) or not _oss_memory_matches(memory, leaves):
+                continue
+            if not scope.get("agent_id") and memory.get("agent_id") not in (None, ""):
+                continue
+            identity = str(memory.get("id") or json.dumps(memory, sort_keys=True))
+            kept.setdefault(identity, memory)
+    results = sorted(kept.values(), key=lambda m: float(m.get("score") or 0), reverse=True)
+    return {"results": results[:top_k]}, req_total, resp_total
 
 
 def _oss_list(base: str, key: str, payload: dict[str, Any], timeout: float):
@@ -2071,6 +2166,35 @@ def acquire_flush_slot(slots: int):
         time.sleep(1)
 
 
+def lock_flush_session(store: EvidenceStore, repo_id: str, session_id: str):
+    """Claim a session across handoff files; process exit releases the lock."""
+    directory = store.path.parent / "flush-locks"
+    directory.mkdir(parents=True, exist_ok=True)
+    identity = hashlib.sha256(f"{repo_id}\0{session_id}".encode()).hexdigest()
+    handle = open(directory / f"{identity}.lock", "a+b")
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif os.name == "nt":
+            import msvcrt
+            if handle.seek(0, os.SEEK_END) == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            raise RuntimeError("No supported session lock; refusing an unprotected flush")
+    except OSError as exc:
+        handle.close()
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            return None
+        raise
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
 def _wait_for_event(api_url: str, key: str, event_id: str) -> tuple[str, int, int]:
     """Wait for extraction to finish before a later task can search the store."""
     if not event_id:
@@ -2132,6 +2256,27 @@ def _record_flush(
 def flush_session(
     store: EvidenceStore, hook_input: dict[str, Any], reason: str
 ) -> dict[str, Any]:
+    if store.is_paused():
+        return {"status": "paused"}
+    session_id = _session_id(hook_input)
+    if session_id == "unknown-session":
+        return _flush_session(store, hook_input, reason)
+    repo = store.repo_for_session(session_id, hook_input.get("cwd"))
+    lock = lock_flush_session(store, repo.identity, session_id)
+    if lock is None:
+        return {"status": "busy", "reason": "session-flush-in-progress"}
+    try:
+        return _flush_session(store, hook_input, reason)
+    finally:
+        lock.close()
+
+
+def _flush_session(
+    store: EvidenceStore, hook_input: dict[str, Any], reason: str
+) -> dict[str, Any]:
+    """Flush batches while the caller retains ownership of this session."""
+    if store.is_paused():
+        return {"status": "paused"}
     key = api_key()
     if not key:
         telemetry.record("flush", reason=reason, status="local-only", success=False)
@@ -2239,7 +2384,7 @@ def flush_session(
                         or store.checkpoint_due(repo.identity, session_id)
                     )
                 ):
-                    return flush_session(store, hook_input, effective_reason)
+                    return _flush_session(store, hook_input, effective_reason)
                 return {
                     "status": "semantic-succeeded",
                     "packet_id": packet_id,
@@ -2296,6 +2441,8 @@ def flush_session(
         semantic_req = 0
         semantic_resp = 0
         for index, (body, messages) in enumerate(batches):
+            if store.is_paused():
+                return {"status": "paused", "packet_id": packet_id}
             if semantic_events[index]:
                 continue
             semantic_response, request_chars, response_chars = _request_json(
@@ -2408,7 +2555,7 @@ def flush_session(
                 or store.checkpoint_due(repo.identity, session_id)
             )
         ):
-            return flush_session(store, hook_input, effective_reason)
+            return _flush_session(store, hook_input, effective_reason)
         return {
             "status": "semantic-succeeded",
             "packet_id": packet_id,
@@ -2713,8 +2860,9 @@ def _collect_memory_ids(
             memory_id = str(item.get("id", ""))
             if not memory_id or memory_id in seen:
                 continue
-            if app_id_prefix and item.get("app_id") is not None:
-                item_app_id = str(item.get("app_id") or "")
+            if app_id_prefix:
+                metadata = item.get("metadata") or {}
+                item_app_id = str(item.get("app_id") or metadata.get("project") or item.get("agent_id") or "")
                 if item_app_id != app_id_prefix and not item_app_id.startswith(app_id_prefix + "/"):
                     continue
             seen.add(memory_id)

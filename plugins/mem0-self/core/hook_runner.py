@@ -270,6 +270,7 @@ def log_failure(exc: Exception) -> None:
 def run(
     *,
     record_stop_fn=None,
+    record_paused_fn=None,
     extra_actions: dict | None = None,
     data_dir_env: str = "MEM0_PLUGIN_DATA_DIR",
     automatic_flush_reasons: set | None = None,
@@ -309,6 +310,8 @@ def run(
     store = EvidenceStore()
     try:
         if store.is_paused():
+            if record_paused_fn is not None:
+                record_paused_fn(store, hook_input)
             if args.action == "session-start":
                 refresh_pending_handoffs()
                 telemetry.record("session_start", paused=True)
@@ -374,6 +377,7 @@ def run(
 def entry_point(
     *,
     record_stop_fn=None,
+    record_paused_fn=None,
     extra_actions: dict | None = None,
     data_dir_env: str = "MEM0_PLUGIN_DATA_DIR",
     automatic_flush_reasons: set | None = None,
@@ -381,6 +385,7 @@ def entry_point(
     try:
         raise SystemExit(run(
             record_stop_fn=record_stop_fn,
+            record_paused_fn=record_paused_fn,
             extra_actions=extra_actions,
             data_dir_env=data_dir_env,
             automatic_flush_reasons=automatic_flush_reasons,
