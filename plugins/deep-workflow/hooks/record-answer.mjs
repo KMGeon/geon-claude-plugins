@@ -5,7 +5,7 @@
 // Claude가 옮겨 적은 정리본과 별개로 "사용자가 실제로 한 말"을 남기고, 범위 확정·스펙 저장 조건의 근거로 쓴다.
 // UserPromptSubmit 훅의 출력은 Claude 대화에 끼어들므로 아무것도 출력하지 않는다.
 
-import { appendAnswer, isActive, projectRoot, readState } from "../skills/deep-interview/scripts/state.mjs";
+import { appendAnswer, isActive, readState, resolveRoot } from "../skills/deep-interview/scripts/state.mjs";
 
 /** 객체인지. */
 const isObject = value => Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -39,8 +39,8 @@ function buildRecord(input, now = new Date()) {
 /** 이 세션에 진행 중인 인터뷰가 있을 때만 기록한다. 기록했으면 true. */
 export function record(input) {
 	if (typeof input?.session_id !== "string") return false;
-	// 인터뷰 CLI와 같은 규칙으로 루트를 정한다 (git 최상위 우선).
-	const root = projectRoot(typeof input.cwd === "string" ? input.cwd : process.cwd());
+	// 인터뷰 CLI와 같은 규칙으로 루트를 정한다 (진행 중인 인터뷰가 있는 루트 → cwd의 git 최상위).
+	const root = resolveRoot(input.session_id, typeof input.cwd === "string" ? input.cwd : process.cwd());
 	if (!isActive(readState(root, input.session_id))) return false;
 	const line = buildRecord(input);
 	if (!line) return false;

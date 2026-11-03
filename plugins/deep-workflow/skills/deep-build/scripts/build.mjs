@@ -21,9 +21,10 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
+import { BUILD_IN_PROGRESS, DIR_NAME, assertSessionId, projectRoot, resolveRoot, writeSessionIndex } from "../../../lib/session-root.mjs";
 
-export const DIR_NAME = ".deep-interview";
+export { DIR_NAME, assertSessionId, projectRoot };
 const MAX_REVIEW_ROUNDS = 3;
 const MAX_TASK_ATTEMPTS = 3;
 const MAX_VERIFY_FAILURES = 3;
@@ -83,30 +84,7 @@ function readInput(flags) {
 	}
 }
 
-/** 세션 ID를 폴더 이름으로 써도 안전한지 확인한다. */
-export function assertSessionId(sessionId) {
-	if (typeof sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(sessionId) || sessionId.startsWith(".")) {
-		throw new Error(`세션 ID가 올바르지 않습니다: ${JSON.stringify(sessionId)}`);
-	}
-	return sessionId;
-}
-
-/** 프로젝트 루트: git 최상위 → 상위의 .deep-interview → cwd. deep-interview와 같은 규칙. */
-export function projectRoot(cwd = process.cwd()) {
-	try {
-		const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
-		if (top) return top;
-	} catch {}
-	let dir = path.resolve(cwd);
-	for (;;) {
-		try {
-			if (fs.statSync(path.join(dir, DIR_NAME)).isDirectory()) return dir;
-		} catch {}
-		const parent = path.dirname(dir);
-		if (parent === dir) return path.resolve(cwd);
-		dir = parent;
-	}
-}
+// 루트 판정(projectRoot: cwd 기준, resolveRoot: 세션 색인 우선)과 세션 ID 검사는 lib/session-root.mjs에 있다. deep-interview와 같은 규칙.
 
 const buildsDir = root => path.join(root, DIR_NAME, "builds");
 const plansDir = root => path.join(root, DIR_NAME, "plans");
@@ -421,8 +399,7 @@ function summary(state) {
 	};
 }
 
-// 아직 끝나지 않은 빌드 상태. 이 상태의 빌드는 --restart 없이 덮어쓰지 않는다.
-const IN_PROGRESS = new Set(["designing", "planning", "reviewing", "revising", "planned", "executing"]);
+// 아직 끝나지 않은 빌드 상태(BUILD_IN_PROGRESS)는 lib/session-root.mjs에 있다. 이 상태의 빌드는 --restart 없이 덮어쓰지 않고, 세션 색인이 이 루트를 가리키게 한다.
 
 /** 스펙을 읽어 빌드 상태를 만든다. 입력 검사를 모두 끝낸 뒤에만 기존 상태를 건드린다. */
 function cmdStart(root, sid, flags) {
@@ -454,7 +431,7 @@ function cmdStart(root, sid, flags) {
 	}
 	if (spec.criteria.length === 0) fail('스펙에 "## 다 됐다는 기준" 항목이 없습니다. 완료 기준 없이는 계획을 검사할 수 없습니다');
 	const existing = readState(root, sid);
-	if (existing && IN_PROGRESS.has(existing.status) && flags.restart !== true) {
+	if (existing && BUILD_IN_PROGRESS.has(existing.status) && flags.restart !== true) {
 		fail(`이 세션에 진행 중인 빌드가 있습니다 (상태: ${existing.status}). 이어가려면 status를 보고, 버리고 새로 시작하려면 --restart를 붙이세요`);
 	}
 	// 여기까지 왔으면 입력은 모두 유효하다. 끝난(또는 버리는) 빌드는 지우지 않고 이름을 바꿔 보관한다.
@@ -480,6 +457,8 @@ function cmdStart(root, sid, flags) {
 		created_at: new Date().toISOString(),
 	};
 	writeState(root, sid, state);
+	// 세션 → 루트 색인. 빌드가 진행 중인 동안 cwd가 바뀌어도(cd) 훅과 명령이 이 루트를 본다.
+	writeSessionIndex(sid, root);
 	return { ok: true, ...summary(state), spec_title: spec.title, interview_checked: Boolean(interview), warnings, next: "설계 문서를 쓰고 design --file로 등록" };
 }
 
@@ -1038,7 +1017,8 @@ export function run(argv, cwd = process.cwd()) {
 	const handler = COMMANDS[command];
 	if (!handler) fail(`알 수 없는 명령입니다: ${JSON.stringify(command)}. 가능한 명령: ${Object.keys(COMMANDS).join(", ")}`);
 	if (!isText(flags.session)) fail("--session이 필요합니다");
-	const root = projectRoot(isText(flags.root) ? flags.root : cwd);
+	// --root가 없으면 세션 색인을 먼저 본다: 이 세션의 진행 중인 인터뷰·빌드가 있는 루트면 cwd가 바뀌었어도 그 루트를 쓴다.
+	const root = isText(flags.root) ? projectRoot(flags.root) : resolveRoot(flags.session, cwd);
 	return handler(root, flags.session, flags);
 }
 

@@ -58,8 +58,9 @@ stateDiagram-v2
 | createRequest | 날짜 | id | 과거 날짜 |
 `;
 
-/** 스펙 파일이 있는 임시 프로젝트를 만든다. */
+/** 스펙 파일이 있는 임시 프로젝트를 만든다. 세션 → 루트 색인(DEEP_WORKFLOW_HOME)도 테스트마다 새 폴더를 쓴다. */
 function project(spec = SPEC) {
+	process.env.DEEP_WORKFLOW_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "deep-workflow-home-"));
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "deep-build-test-"));
 	fs.mkdirSync(path.join(root, ".deep-interview/specs"), { recursive: true });
 	fs.writeFileSync(path.join(root, ".deep-interview/specs/deep-interview-leave.md"), spec);
@@ -535,4 +536,14 @@ test("final-review: revise면 blocker 지적이 가리키는 작업(AC·파일 �
 	const r3 = cli(root, "final-review", "--input", jsonFile(root, "fr.json", { verdict: "revise", criteria: OK_CRITERIA, findings: [{ target: "어딘가", severity: "blocker", finding: "x" }] }));
 	assert.deepEqual(r3.reopened_tasks, []);
 	assert.equal(readState(root, SID).status, "stuck");
+});
+
+test("빌드가 진행 중이면 cwd가 다른 폴더여도 같은 빌드를 본다 (세션 색인)", () => {
+	const root = project();
+	const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "elsewhere-"));
+	assert.equal(run(["status", "--session", SID], elsewhere).exists, false);
+	run(["start", "--spec", ".deep-interview/specs/deep-interview-leave.md", "--session", SID], root);
+	assert.equal(run(["status", "--session", SID], elsewhere).exists, true);
+	assert.equal(run(["status", "--session", SID], elsewhere).status, "designing");
+	assert.equal(fs.existsSync(path.join(elsewhere, ".deep-interview")), false);
 });

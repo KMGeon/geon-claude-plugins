@@ -7,9 +7,9 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { DIR_NAME, assertSessionId, findRoot, projectRoot, resolveRoot, writeSessionIndex } from "../../../lib/session-root.mjs";
 
-export const DIR_NAME = ".deep-interview";
+export { DIR_NAME, assertSessionId, findRoot, projectRoot, resolveRoot, writeSessionIndex };
 export const HARD_CAP_ROUNDS = 30;
 export const EARLY_EXIT_MIN_ROUNDS = 3;
 
@@ -64,40 +64,8 @@ export const CHECK_DIMENSION = Object.fromEntries(
 // 경로
 // =============================================================================
 
-/** 세션 ID를 폴더 이름으로 써도 안전한지 확인한다 (`../` 같은 경로 조작 방지). */
-export function assertSessionId(sessionId) {
-	if (typeof sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(sessionId) || sessionId.startsWith(".")) {
-		throw new Error(`세션 ID가 올바르지 않습니다: ${JSON.stringify(sessionId)}`);
-	}
-	return sessionId;
-}
-
-/** `start`에서 위로 올라가며 `.deep-interview` 폴더가 있는 디렉터리를 찾는다. 없으면 null. */
-export function findRoot(start) {
-	let dir = path.resolve(start);
-	for (;;) {
-		try {
-			if (fs.statSync(path.join(dir, DIR_NAME)).isDirectory()) return dir;
-		} catch {}
-		const parent = path.dirname(dir);
-		if (parent === dir) return null;
-		dir = parent;
-	}
-}
-
-/**
- * 프로젝트 루트: git 최상위 폴더 → 이미 있는 `.deep-interview`의 위치 → `cwd` 순서로 정한다.
- * git을 먼저 보는 이유: 홈 폴더 같은 상위에 `.deep-interview`가 있어도 기록이 그쪽으로 새지 않게 하기 위해서다.
- */
-export function projectRoot(cwd = process.cwd()) {
-	try {
-		const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] })
-			.toString()
-			.trim();
-		if (top) return top;
-	} catch {}
-	return findRoot(cwd) ?? path.resolve(cwd);
-}
+// 루트 판정(projectRoot: cwd 기준, resolveRoot: 세션 색인 우선)과 세션 ID 검사는 lib/session-root.mjs에 있다.
+// 인터뷰 명령, 빌드 명령, 훅이 모두 같은 규칙을 쓴다. 다르게 정하면 CLI가 쓴 상태를 훅이 못 본다.
 
 export const sessionsDir = root => path.join(root, DIR_NAME, "sessions");
 export const sessionDir = (root, sid) => path.join(sessionsDir(root), assertSessionId(sid));
@@ -157,6 +125,29 @@ export function appendAnswer(root, sid, record) {
 /** 인터뷰가 진행 중인지. 진행 중이면 가드 훅이 코드 수정을 막는다. */
 export function isActive(state) {
 	return Boolean(state) && state.active === true;
+}
+
+// =============================================================================
+// 사용자 확인 선택지
+// =============================================================================
+
+// 코드가 "사용자가 확인했다"로 받는 선택지 글자. 범위 확정(scope)과 스펙 저장·정상 종료(completionBlocker)가 본다.
+// SKILL은 이 글자를 바꾸지 않고 쓴다. 끝에 " (추천)"은 붙여도 된다.
+// 답 개수만 세면 되물음("그게 무슨 뜻이에요?")이나 잡담도 확인으로 세어지므로, 선택지 창에서 이 글자를 고른 기록만 받는다.
+export const CONFIRM_LABELS = { scope: "맞아요", spec: "네, 이대로" };
+
+/** 선택지 글자를 비교용으로 정리한다: 끝의 "(추천)"을 떼고 공백을 하나로 줄인다. */
+export function normalizeLabel(value) {
+	return String(value ?? "")
+		.replace(/\s*[(（]\s*추천\s*[)）]\s*$/u, "")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+/** 답 기록 한 건이 선택지 창(AskUserQuestion)에서 이 선택지를 고른 것인지. 채팅 답은 아니다. */
+export function pickedLabel(answer, label) {
+	if (answer?.source !== "ask" || !answer.answers || typeof answer.answers !== "object") return false;
+	return Object.values(answer.answers).some(value => normalizeLabel(value) === label);
 }
 
 // =============================================================================
@@ -273,7 +264,7 @@ export function evaluateState(state) {
  * 인터뷰를 마쳐도(스펙 저장, end --status done) 되는지 확인한다. 안 되면 이유 문자열, 되면 null.
  * - 기록된 라운드가 있어야 한다
  * - 코드가 계산한 모호도가 기준값 이하이거나, 조기 종료를 표시했어야 한다
- * - 마지막 라운드 뒤에 사용자 답(한 문장 맞춰 보기 확인)이 기록돼 있어야 한다
+ * - 마지막 라운드 뒤의 마지막 사용자 답이 선택지 창에서 "네, 이대로"(한 문장 맞춰 보기 확인)를 고른 기록이어야 한다
  */
 export function completionBlocker(root, sid, state) {
 	const rounds = state.rounds ?? [];
@@ -287,10 +278,13 @@ export function completionBlocker(root, sid, state) {
 			return `아직 기준값을 넘지 못한 덩어리가 있습니다: ${evaluation.lagging.join(", ")}. 그 덩어리를 더 묻거나, 사용자가 원하면 early-exit를 실행하세요.`;
 		}
 	}
-	// 시각 비교 대신 개수로 본다: 마지막 라운드를 기록할 때보다 사용자 답이 늘었는지.
+	// 시각 비교 대신 개수로 본다: 마지막 라운드를 기록한 뒤에 온 답이어야 하고, 그 마지막 답이 선택지 창에서 "네, 이대로"를 고른 것이어야 한다.
+	// 채팅 답, 되물음, 다른 선택지는 받지 않는다. 확인 뒤에 사용자가 다른 말을 했으면 다시 확인받아야 한다.
 	const seenAtLastRound = Math.max(...rounds.map(round => round.answers_seen ?? Number.POSITIVE_INFINITY));
-	if (!(readAnswers(root, sid).length > seenAtLastRound)) {
-		return "마지막 라운드 뒤에 기록된 사용자 답이 없습니다. 한 문장 맞춰 보기를 사용자에게 확인받으세요.";
+	const answers = readAnswers(root, sid);
+	const last = answers.length > seenAtLastRound ? answers.at(-1) : null;
+	if (!pickedLabel(last, CONFIRM_LABELS.spec)) {
+		return `마지막 라운드 뒤에 사용자가 선택지 창에서 "${CONFIRM_LABELS.spec}"를 고른 기록이 없습니다. 한 문장 맞춰 보기를 AskUserQuestion으로 묻고 그 선택지를 받으세요 (채팅 답이나 되물음은 확인으로 세지 않습니다).`;
 	}
 	return null;
 }
