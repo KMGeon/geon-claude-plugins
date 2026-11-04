@@ -1,40 +1,42 @@
 #!/usr/bin/env node
-// 딥 인터뷰 상태 명령. 인터뷰 상태 파일은 이 스크립트로만 바꾼다.
+// 딥 인터뷰 조서 명령. 인터뷰 상태 파일은 이 스크립트로만 바꾼다.
 //
 // 사용법 (모두 --session <세션ID> 필요):
-//   start  --topic <주제> [--quick|--deep] [--type greenfield|brownfield]   인터뷰 시작, 코드 수정 차단 시작
-//   scope  --input <JSON>     Round 0에서 확인받은 덩어리와 고정 항목을 저장
-//   record --input <JSON>     라운드 하나(질문, 답, 체크리스트 답, 사실 변경)를 기록하고 모호도를 계산
-//   early-exit                조기 종료 표시 (3라운드 이후)
-//   status                    현재 상태 보기
-//   end    [--status done|cancelled] [--spec <경로>]   인터뷰 종료, 차단 해제
+//   start  --topic <주제> [--type greenfield|brownfield]   인터뷰 시작, 코드 수정 차단 시작
+//   note   --input <JSON>     답 하나를 조서에 적는다 (진술, 구멍, 닫은 구멍, 모순). turn 0은 첫 조서(코드·첫 말 정리)
+//   board                     조서 전체 보기 (이어하기, 낭독 전 확인)
+//   review --input <JSON>     두 번째 형사가 조서만 보고 찾은 구멍을 기록. 없으면 서명 가능
+//   sign   --slug <이름> --summary <한 문단> [--early]   서명 확인 → 스펙 생성 → 차단 해제
+//   end    [--status cancelled]   용의자가 그만둘 때. 기록은 남기고 차단만 푼다
 // --input은 JSON 문자열 또는 @파일경로. 결과는 JSON으로 출력하고, 실패하면 {"ok": false, "error": "..."}와 종료 코드 1.
 
 import fs from "node:fs";
 import path from "node:path";
 import {
-	CHECK_DIMENSION,
+	AREAS,
 	CONFIRM_LABELS,
+	COSTS,
 	DIR_NAME,
-	DIMENSION_NAMES,
-	EARLY_EXIT_MIN_ROUNDS,
-	HARD_CAP_ROUNDS,
-	THRESHOLDS,
-	WEIGHTS,
+	HARD_CAP_TURNS,
+	SOURCES,
+	STATE_VERSION,
+	TYPES,
 	answersPath,
-	completionBlocker,
-	componentProgress,
-	dimensionsFor,
-	evaluateState,
+	areaCoverage,
+	changedSince,
+	counts,
 	isActive,
-	milestoneFor,
-	overallScores,
-	pickedLabel,
+	lastTurn,
+	liveStatements,
+	openGaps,
 	projectRoot,
 	readAnswers,
 	readState,
+	readinessBlocker,
 	resolveRoot,
-	round2,
+	reviewAfterLastTurn,
+	signBlocker,
+	specsDir,
 	statePath,
 	suggestNext,
 	writeSessionIndex,
@@ -52,8 +54,8 @@ function fail(message) {
 // 인자 해석
 // =============================================================================
 
-// 값을 받지 않는 플래그. 뒤에 오는 단어를 값으로 삼키지 않는다 (`--deep leave`가 조용히 기본값이 되는 것 방지).
-const BOOLEAN_FLAGS = new Set(["quick", "deep"]);
+// 값을 받지 않는 플래그. 뒤에 오는 단어를 값으로 삼키지 않는다.
+const BOOLEAN_FLAGS = new Set(["early"]);
 
 /** `<명령> --키 값 --플래그` 형태를 { command, flags }로 바꾼다. 값 없는 플래그는 true. */
 function parseArgs(argv) {
@@ -73,18 +75,20 @@ function parseArgs(argv) {
 	return { command, flags };
 }
 
-/** `--input`을 읽는다. `@경로`면 파일 내용을 읽는다. */
-function readInput(flags) {
-	const raw = flags.input;
-	if (typeof raw !== "string" || !raw) fail("--input이 필요합니다");
-	let text = raw;
-	if (raw.startsWith("@")) {
-		try {
-			text = fs.readFileSync(raw.slice(1), "utf8");
-		} catch {
-			fail(`--input 파일을 읽을 수 없습니다: ${raw.slice(1)}`);
-		}
+/** `@경로`면 파일 내용을, 아니면 값 그대로. */
+function readMaybeFile(raw, label) {
+	if (typeof raw !== "string" || !raw) fail(`${label}이 필요합니다`);
+	if (!raw.startsWith("@")) return raw;
+	try {
+		return fs.readFileSync(raw.slice(1), "utf8");
+	} catch {
+		fail(`${label} 파일을 읽을 수 없습니다: ${raw.slice(1)}`);
 	}
+}
+
+/** `--input`을 JSON 객체로 읽는다. */
+function readInput(flags) {
+	const text = readMaybeFile(flags.input, "--input");
 	try {
 		const parsed = JSON.parse(text);
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) fail("--input은 JSON 객체여야 합니다");
@@ -96,6 +100,12 @@ function readInput(flags) {
 }
 
 const isText = value => typeof value === "string" && value.trim().length > 0;
+const asList = (value, label) => {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) fail(`${label}은(는) 배열이어야 합니다`);
+	return value;
+};
+const normalizeText = value => String(value).replace(/\s+/g, " ").trim();
 
 // =============================================================================
 // 도우미
@@ -106,8 +116,12 @@ function requireActive(root, sid) {
 	const state = readState(root, sid);
 	if (!state) fail("이 세션에는 인터뷰 상태가 없습니다. 먼저 start를 실행하세요");
 	if (!isActive(state)) fail(`이 세션의 인터뷰는 이미 끝났습니다 (상태: ${state.status})`);
+	if ((state.version ?? 1) < STATE_VERSION) fail("이전 버전(체크리스트 방식)의 인터뷰 상태입니다. end --status cancelled로 끝내고 새로 시작하세요");
 	return state;
 }
+
+/** 사용자 답을 받은 턴(첫 조서 turn 0은 제외). */
+const realTurns = state => (state.turns ?? []).filter(turn => turn.turn > 0);
 
 /** 명령 결과에 붙일 요약. */
 function summary(root, sid, state) {
@@ -116,27 +130,24 @@ function summary(root, sid, state) {
 		status: state.status,
 		topic: state.topic,
 		type: state.type,
-		threshold: state.threshold,
-		threshold_source: state.threshold_source,
-		current_ambiguity: state.current_ambiguity,
-		rounds: (state.rounds ?? []).length,
-		scope_confirmed: Boolean(state.scope_confirmed_at),
-		components: componentProgress(state),
+		turns: realTurns(state).length,
+		counts: counts(state),
 		answers_recorded: readAnswers(root, sid).length,
 	};
 }
 
-/** 항목별 점수표 (화면의 점수표에 그대로 쓰는 숫자). */
-function scoreTable(state) {
-	const weights = WEIGHTS[state.type] ?? WEIGHTS.greenfield;
-	const overall = overallScores(state);
-	return dimensionsFor(state.type).map(dimension => ({
-		dimension,
-		name: DIMENSION_NAMES[dimension],
-		score: overall[dimension],
-		weight: weights[dimension],
-		weighted: round2(overall[dimension] * weights[dimension]),
-	}));
+/** 구멍 하나를 화면용으로 줄인다. */
+const gapView = gap => ({ id: gap.id, text: gap.text, area: AREAS[gap.area], cost: gap.cost, why_cost: gap.why_cost ?? null });
+/** 진술 하나를 화면용으로 줄인다. */
+const statementView = statement => ({ id: statement.id, text: statement.text, area: AREAS[statement.area], status: statement.status, source: statement.source, fixed: statement.fixed ?? null });
+
+/** 다음 질문 제안을 화면용으로. */
+function nextView(state) {
+	const next = suggestNext(state);
+	if (!next) return null;
+	if (next.kind === "dispute") return { kind: "dispute", statement: statementView(next.statement), claim: next.statement.dispute?.claim ?? null };
+	if (next.kind === "gap") return { kind: "gap", gap: gapView(next.gap) };
+	return next;
 }
 
 /**
@@ -154,20 +165,33 @@ function ensureGitignore(root) {
 	fs.writeFileSync(file, `${current}${prefix}# 딥 인터뷰 상태, 사용자 답 원문, 빌드 상태 (커밋하지 않음)\n${missing.join("\n")}\n`);
 }
 
+/** 근거 문장에 프로젝트 안에 실제로 있는 파일·폴더 경로가 하나라도 들어 있는지. 코드 출처 진술은 이게 있어야 받는다. */
+function evidenceHasPath(root, evidence) {
+	const realRoot = path.resolve(root);
+	const tokens = String(evidence).match(/[\p{L}\p{N}_@./-]+/gu) ?? [];
+	return tokens.some(token => {
+		const cleaned = token.replace(/[.:]+$/, "");
+		if (!/[\p{L}\p{N}]/u.test(cleaned) || !(cleaned.includes("/") || cleaned.includes("."))) return false;
+		const abs = path.resolve(realRoot, cleaned);
+		const rel = path.relative(realRoot, abs);
+		if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return false; // 프로젝트 밖이나 루트 자체는 근거가 아니다
+		return fs.existsSync(abs);
+	});
+}
+
 // =============================================================================
-// 명령
+// 명령: start
 // =============================================================================
 
 /** 인터뷰를 시작한다. 같은 세션에 끝난 인터뷰가 있으면 이름을 바꿔 보관하고 새로 만든다. */
 function cmdStart(root, sid, flags) {
 	const existing = readState(root, sid);
 	if (isActive(existing)) {
-		writeSessionIndex(sid, root); // 색인이 없던 세션(이전 버전)도 이제부터 cwd와 무관하게 같은 루트를 보게 한다.
+		writeSessionIndex(sid, root);
 		return { ok: true, already_active: true, ...summary(root, sid, existing) };
 	}
-	// 입력 검사를 먼저 한다. 잘못된 입력 때문에 기존 기록만 보관되고 새 상태가 없는 일을 막는다.
 	const type = flags.type ?? "greenfield";
-	if (!(type in WEIGHTS)) fail('--type은 "greenfield" 또는 "brownfield"여야 합니다');
+	if (!TYPES.includes(type)) fail(`--type은 ${TYPES.join(" 또는 ")}여야 합니다`);
 	if (existing) {
 		const stamp = (existing.ended_at ?? existing.started_at ?? new Date().toISOString()).replace(/[:.]/g, "-");
 		fs.renameSync(statePath(root, sid), statePath(root, sid).replace(/state\.json$/, `state-${stamp}.json`));
@@ -175,301 +199,458 @@ function cmdStart(root, sid, flags) {
 			fs.renameSync(answersPath(root, sid), answersPath(root, sid).replace(/answers\.jsonl$/, `answers-${stamp}.jsonl`));
 		}
 	}
-	const mode = flags.deep === true ? "deep" : flags.quick === true ? "quick" : "default";
-	const { value, source } = THRESHOLDS[mode];
 	ensureGitignore(root);
 	const state = {
-		version: 1,
+		version: STATE_VERSION,
 		session: sid,
 		topic: isText(flags.topic) ? flags.topic : null,
 		active: true,
 		status: "interviewing",
 		started_at: new Date().toISOString(),
 		type,
-		threshold: value,
-		threshold_source: source,
 		components: [],
-		fixed_items: [],
-		scope_confirmed_at: null,
-		scope_history: [],
-		checks: {},
-		rounds: [],
-		facts: [],
-		current_ambiguity: 1,
-		milestone: "시작",
+		statements: [],
+		gaps: [],
+		turns: [],
+		reviews: [],
 		early_exit: false,
 		answers_at_start: readAnswers(root, sid).length,
 	};
 	writeState(root, sid, state);
-	// 세션 → 루트 색인. 인터뷰가 진행 중인 동안 cwd가 바뀌어도(cd) 훅과 명령이 이 루트를 본다.
 	writeSessionIndex(sid, root);
+	return { ok: true, already_active: false, marker: "조서 | 확정 0 · 잠정 0 · 모순 0 · 구멍 0", ...summary(root, sid, state) };
+}
+
+// =============================================================================
+// 명령: note
+// =============================================================================
+
+const nextId = (items, prefix) => `${prefix}${items.length + 1}`;
+
+/** 진술 id로 살아 있는 진술을 찾는다. 없으면 거부. */
+function liveById(state, id, label) {
+	const statement = (state.statements ?? []).find(item => item.id === id);
+	if (!statement) fail(`${label}: 없는 진술입니다: ${id}`);
+	if (statement.status === "retracted") fail(`${label}: 이미 철회된 진술입니다: ${id}`);
+	return statement;
+}
+
+/** 덩어리 목록을 갱신한다 (있으면 바꾸고 없으면 추가). 덩어리는 구멍·진술을 묶는 라벨일 뿐이다. */
+function applyComponents(state, items) {
+	for (const item of items) {
+		if (!isText(item?.id) || /\s/.test(item.id)) fail("덩어리 id는 공백 없는 문자열이어야 합니다");
+		const status = item.status ?? "active";
+		if (!["active", "deferred"].includes(status)) fail(`덩어리 ${item.id}의 status는 active 또는 deferred여야 합니다`);
+		const next = { id: item.id, name: isText(item.name) ? item.name : item.id, description: item.description ?? "", status, reason: item.reason ?? null };
+		const at = state.components.findIndex(component => component.id === item.id);
+		if (at >= 0) state.components[at] = { ...state.components[at], ...next };
+		else state.components.push(next);
+	}
+}
+
+/** 진술을 철회한다. */
+function retract(statement, turn, reason, extra = {}) {
+	Object.assign(statement, { status: "retracted", retracted_turn: turn, retracted_reason: reason, updated_turn: turn, ...extra });
+}
+
+/** 진술 하나를 적는다. 새 진술이면 추가, 같은 id면 다시 말한 것으로 보고 승격을 검토한다. 돌려주는 값은 그 진술. */
+function applyStatement(root, state, input, turn, changed) {
+	if (!isText(input?.text)) fail("statements의 항목마다 text가 필요합니다");
+	if (!(input.area in AREAS)) fail(`statements.${input.id ?? "?"}: area는 ${Object.keys(AREAS).join(", ")} 중 하나여야 합니다`);
+	const source = input.source ?? "inferred";
+	if (!SOURCES.includes(source)) fail(`statements.${input.id ?? "?"}: source는 ${SOURCES.join(", ")} 중 하나여야 합니다`);
+	if (source === "code" && !(isText(input.evidence) && evidenceHasPath(root, input.evidence))) {
+		fail(`statements.${input.id ?? "?"}: 코드 출처(source: "code") 진술은 evidence에 프로젝트 안에 실제로 있는 파일 경로가 있어야 합니다`);
+	}
+	if (input.fixed !== undefined) {
+		if (!isText(input.fixed) || /\s/.test(input.fixed) || !input.fixed.includes(":")) fail(`statements.${input.id ?? "?"}: fixed는 "종류:이름" 꼴의 공백 없는 ID여야 합니다`);
+		const dup = state.statements.find(item => item.fixed === input.fixed && item.id !== input.id && item.status !== "retracted");
+		if (dup) fail(`고정 항목 ID가 겹칩니다: ${input.fixed} (진술 ${dup.id})`);
+	}
+	if (input.component !== undefined && !state.components.some(component => component.id === input.component)) {
+		fail(`statements.${input.id ?? "?"}: component는 덩어리 id 중 하나여야 합니다: ${input.component}`);
+	}
+	const text = normalizeText(input.text);
+	const existing = isText(input.id) ? state.statements.find(item => item.id === input.id) : null;
+	if (existing) {
+		if (existing.status === "retracted") fail(`철회된 진술은 다시 쓸 수 없습니다: ${existing.id}. 새 진술로 적으세요`);
+		if (existing.status === "disputed") fail(`모순 중인 진술은 resolve로 먼저 정리하세요: ${existing.id}`);
+		if (normalizeText(existing.text) === text) {
+			existing.times = (existing.times ?? 1) + 1;
+		} else {
+			if (existing.status === "confirmed") fail(`확정 진술의 내용은 바꿀 수 없습니다: ${existing.id}. 말이 바뀌었으면 disputes로 적고 resolve로 정리하세요`);
+			existing.history = [...(existing.history ?? []), { text: existing.text, turn: existing.turn }];
+			existing.text = text;
+			existing.times = 1;
+		}
+		if (source === "user") existing.source = "user";
+		if (isText(input.evidence)) existing.evidence = input.evidence;
+		if (input.fixed !== undefined) existing.fixed = input.fixed;
+		if (input.component !== undefined) existing.component = input.component;
+		existing.updated_turn = turn;
+		// 승격: 사용자가 직접 말했거나, 형사가 정리한 것을 두 번 이상 일관되게 말했으면 확정. 대신 정한 것(auto)은 서명 전엔 확정하지 않는다.
+		const promote = existing.status === "tentative" && (existing.source === "user" || (existing.source !== "auto" && existing.times >= 2));
+		if (promote) {
+			existing.status = "confirmed";
+			existing.confirmed_turn = turn;
+			changed.promoted.push(existing.id);
+		}
+		changed.statements.push(existing.id);
+		return existing;
+	}
+	if (isText(input.id) && /\s/.test(input.id)) fail("진술 id는 공백 없는 문자열이어야 합니다");
+	const statement = {
+		id: isText(input.id) ? input.id : nextId(state.statements, "s"),
+		text,
+		area: input.area,
+		source,
+		evidence: isText(input.evidence) ? input.evidence : null,
+		status: source === "user" ? "confirmed" : "tentative",
+		turn,
+		updated_turn: turn,
+		times: 1,
+		...(input.fixed !== undefined ? { fixed: input.fixed } : {}),
+		...(input.component !== undefined ? { component: input.component } : {}),
+		...(source === "user" ? { confirmed_turn: turn } : {}),
+	};
+	if (state.statements.some(item => item.id === statement.id)) fail(`진술 id가 겹칩니다: ${statement.id}`);
+	state.statements.push(statement);
+	changed.statements.push(statement.id);
+	return statement;
+}
+
+/** 구멍 하나를 연다. */
+function openGap(state, input, turn, changed, extra = {}) {
+	if (!isText(input?.text)) fail("gaps의 항목마다 text가 필요합니다");
+	if (!(input.area in AREAS)) fail(`gaps.${input.id ?? "?"}: area는 ${Object.keys(AREAS).join(", ")} 중 하나여야 합니다`);
+	const cost = input.cost ?? "mid";
+	if (!COSTS.includes(cost)) fail(`gaps.${input.id ?? "?"}: cost는 ${COSTS.join(", ")} 중 하나여야 합니다`);
+	if (input.component !== undefined && !state.components.some(component => component.id === input.component)) {
+		fail(`gaps.${input.id ?? "?"}: component는 덩어리 id 중 하나여야 합니다: ${input.component}`);
+	}
+	if (isText(input.id) && /\s/.test(input.id)) fail("구멍 id는 공백 없는 문자열이어야 합니다");
+	const gap = {
+		id: isText(input.id) ? input.id : nextId(state.gaps, "g"),
+		text: normalizeText(input.text),
+		area: input.area,
+		cost,
+		why_cost: isText(input.why_cost) ? input.why_cost : null,
+		status: "open",
+		opened_turn: turn,
+		closed_turn: null,
+		closed_by: [],
+		...(input.component !== undefined ? { component: input.component } : {}),
+		...extra,
+	};
+	if (state.gaps.some(item => item.id === gap.id)) fail(`구멍 id가 겹칩니다: ${gap.id}`);
+	state.gaps.push(gap);
+	changed.gaps_opened.push(gap.id);
+	return gap;
+}
+
+/**
+ * 답 하나를 조서에 적는다. 적용 순서: 덩어리 → 철회 → 되돌림(reopen) → 모순 → 정리(resolve) → 진술 → 구멍 → 닫기.
+ * turn 0은 첫 조서(코드와 첫 말로 만든 진술·구멍)이고 질문·답이 없다. 그 뒤는 1, 2, 3… 순서대로만 받는다.
+ */
+function cmdNote(root, sid, flags) {
+	const state = requireActive(root, sid);
+	const input = readInput(flags);
+	const turn = input.turn;
+	const last = lastTurn(state);
+	if (!Number.isInteger(turn) || turn < 0) fail("turn은 0 이상의 정수여야 합니다");
+	if (turn === 0) {
+		if ((state.turns ?? []).length > 0) fail("turn 0(첫 조서)은 처음 한 번만 쓸 수 있습니다");
+	} else {
+		if (turn !== last + 1) fail(`다음 턴 번호는 ${last + 1}입니다 (같은 턴을 다시 적을 수 없습니다. 잘못 적은 진술은 retract, 바뀐 말은 disputes로)`);
+		if (!isText(input.question) || !isText(input.answer)) fail("turn 1부터는 question과 answer가 필요합니다");
+	}
+	const source = input.answer_source ?? "user";
+	if (!["user", "auto"].includes(source)) fail("answer_source는 user 또는 auto여야 합니다");
+	if (state.statements.some(s => s.status === "disputed") && turn > 0 && asList(input.resolve, "resolve").length === 0) {
+		// 모순이 남아 있으면 그 턴은 모순 정리여야 한다. 다른 질문으로 넘어가지 못하게 막는다.
+		fail(`모순이 남아 있습니다 (${state.statements.filter(s => s.status === "disputed").map(s => s.id).join(", ")}). 이 턴은 어느 쪽이 맞는지 묻고 resolve로 정리해야 합니다`);
+	}
+
+	const changed = { statements: [], promoted: [], gaps_opened: [], gaps_closed: [], retracted: [], disputed: [], resolved: [] };
+	applyComponents(state, asList(input.components, "components"));
+
+	for (const id of asList(input.retract, "retract")) {
+		retract(liveById(state, id, "retract"), turn, "retracted");
+		changed.retracted.push(id);
+	}
+	for (const id of asList(input.reopen, "reopen")) {
+		const statement = liveById(state, id, "reopen");
+		retract(statement, turn, "reopened");
+		changed.retracted.push(id);
+		openGap(state, { text: statement.text, area: statement.area, cost: "high", why_cost: "낭독에서 용의자가 아니라고 함", component: statement.component }, turn, changed, { from_statement: id });
+	}
+	for (const item of asList(input.disputes, "disputes")) {
+		const statement = liveById(state, item?.statement, "disputes");
+		if (!isText(item.claim)) fail(`disputes.${item.statement}: claim(지금 한 말)이 필요합니다`);
+		if (statement.status === "disputed") fail(`이미 모순으로 적힌 진술입니다: ${statement.id}`);
+		statement.before_dispute = statement.status;
+		statement.status = "disputed";
+		statement.dispute = { claim: normalizeText(item.claim), turn };
+		statement.updated_turn = turn;
+		changed.disputed.push(statement.id);
+	}
+	for (const item of asList(input.resolve, "resolve")) {
+		const statement = liveById(state, item?.statement, "resolve");
+		if (statement.status !== "disputed") fail(`모순이 아닌 진술은 resolve할 수 없습니다: ${statement.id}`);
+		if (!["old", "new"].includes(item.keep)) fail(`resolve.${statement.id}: keep은 old(원래 말) 또는 new(지금 말)여야 합니다`);
+		const dispute = statement.dispute ?? { claim: null };
+		statement.resolved = [...(statement.resolved ?? []), { ...dispute, keep: item.keep, resolved_turn: turn }];
+		delete statement.dispute;
+		delete statement.before_dispute;
+		if (item.keep === "old") {
+			// 용의자가 원래 말을 다시 확인했다 → 확정.
+			Object.assign(statement, { status: "confirmed", source: "user", times: (statement.times ?? 1) + 1, confirmed_turn: turn, updated_turn: turn });
+			changed.resolved.push({ statement: statement.id, keep: "old" });
+		} else {
+			const text = isText(item.text) ? item.text : dispute.claim;
+			if (!isText(text)) fail(`resolve.${statement.id}: 새 진술 text가 필요합니다`);
+			const replacement = applyStatement(root, state, { text, area: statement.area, source: "user", fixed: statement.fixed, component: statement.component }, turn, changed);
+			retract(statement, turn, "superseded", { superseded_by: replacement.id });
+			changed.resolved.push({ statement: statement.id, keep: "new", replacement: replacement.id });
+		}
+	}
+	for (const item of asList(input.statements, "statements")) applyStatement(root, state, item, turn, changed);
+	for (const item of asList(input.gaps, "gaps")) openGap(state, item, turn, changed);
+	for (const item of asList(input.close, "close")) {
+		const gap = state.gaps.find(g => g.id === item?.gap);
+		if (!gap) fail(`close: 없는 구멍입니다: ${item?.gap}`);
+		if (gap.status !== "open") fail(`close: 이미 닫힌 구멍입니다: ${gap.id}`);
+		const by = asList(item.by, `close.${gap.id}.by`);
+		if (by.length === 0) fail(`close.${gap.id}: 어느 진술로 닫는지 by에 진술 id를 적으세요`);
+		for (const id of by) liveById(state, id, `close.${gap.id}.by`);
+		Object.assign(gap, { status: "closed", closed_turn: turn, closed_by: by });
+		changed.gaps_closed.push(gap.id);
+	}
+	for (const id of asList(input.planted, "planted")) liveById(state, id, "planted");
+
+	state.turns.push({
+		turn,
+		question: turn === 0 ? null : input.question,
+		answer: turn === 0 ? null : input.answer,
+		answer_source: turn === 0 ? null : source,
+		planted: asList(input.planted, "planted"),
+		note: isText(input.note) ? input.note : null,
+		counts: null,
+		recorded_at: new Date().toISOString(),
+		// 이 턴을 적을 때까지 쌓인 사용자 답 수. 서명 답이 그 뒤에 왔는지 셀 때 쓴다.
+		answers_seen: readAnswers(root, sid).length,
+	});
+	state.turns.at(-1).counts = counts(state);
+
+	let autoStreak = 0;
+	for (let i = state.turns.length - 1; i >= 0 && state.turns[i].answer_source === "auto"; i -= 1) autoStreak += 1;
+
+	writeState(root, sid, state);
+	const open = openGaps(state);
 	return {
 		ok: true,
-		already_active: false,
-		marker: `딥 인터뷰 기준값: ${Math.round(value * 100)}% (${source})`,
+		turn,
+		counts: counts(state),
+		changed,
+		open_gaps: open.slice(0, 5).map(gapView),
+		open_gaps_total: open.length,
+		coverage: areaCoverage(state),
+		next: nextView(state),
+		ready_for_review: readinessBlocker(state) === null,
+		must_ask_user: autoStreak >= 3,
+		hard_cap: turn >= HARD_CAP_TURNS,
+	};
+}
+
+// =============================================================================
+// 명령: board, review
+// =============================================================================
+
+/** 조서 전체. 이어하기와 낭독 전 확인, 훅 동작 확인(answers_recorded)에 쓴다. */
+function cmdBoard(root, sid) {
+	const state = readState(root, sid);
+	if (!state) return { ok: true, exists: false, active: false };
+	const review = (state.reviews ?? []).at(-1) ?? null;
+	return {
+		ok: true,
+		exists: true,
+		...summary(root, sid, state),
+		components: state.components ?? [],
+		statements: liveStatements(state).map(statementView),
+		retracted: (state.statements ?? []).filter(s => s.status === "retracted").map(s => ({ id: s.id, text: s.text, reason: s.retracted_reason, superseded_by: s.superseded_by ?? null })),
+		open_gaps: openGaps(state).map(gapView),
+		coverage: areaCoverage(state),
+		next: isActive(state) ? nextView(state) : null,
+		readiness_blocker: isActive(state) ? readinessBlocker(state) : null,
+		review: review ? { turn: review.turn, new_gaps: review.new_gaps, note: review.note } : null,
+		changed_since_review: review ? changedSince(state, review.turn) : null,
+		state,
+	};
+}
+
+/**
+ * 두 번째 형사 검토를 기록한다. 낭독 조건(구멍 0·모순 0·항목마다 진술)이 맞을 때만 받는다.
+ * 새 구멍이 있으면 열고 질문 루프로 돌아간다. 없으면 서명할 수 있다.
+ */
+function cmdReview(root, sid, flags) {
+	const state = requireActive(root, sid);
+	const blocker = readinessBlocker(state);
+	if (blocker) fail(`아직 두 번째 형사를 부를 때가 아닙니다: ${blocker}`);
+	const input = readInput(flags);
+	const turn = lastTurn(state);
+	const changed = { statements: [], promoted: [], gaps_opened: [], gaps_closed: [], retracted: [], disputed: [], resolved: [] };
+	for (const item of asList(input.new_gaps, "new_gaps")) openGap(state, item, turn, changed, { from_review: true });
+	state.reviews.push({ turn, new_gaps: changed.gaps_opened, note: isText(input.note) ? input.note : null, at: new Date().toISOString(), answers_seen: readAnswers(root, sid).length });
+	writeState(root, sid, state);
+	return {
+		ok: true,
+		turn,
+		new_gaps: changed.gaps_opened.map(id => gapView(state.gaps.find(g => g.id === id))),
+		ready_to_sign: changed.gaps_opened.length === 0,
+		counts: counts(state),
+		next: nextView(state),
+	};
+}
+
+// =============================================================================
+// 명령: sign (스펙 생성)
+// =============================================================================
+
+const SPEC_SUFFIX = " — 딥 인터뷰 스펙";
+const bullet = items => (items.length ? items.map(text => `- ${text}`) : ["- 없음"]);
+const STATUS_LABEL = { confirmed: "확정", tentative: "잠정", disputed: "모순", retracted: "철회" };
+const SOURCE_LABEL = { user: "용의자 말", inferred: "형사 정리", code: "코드", auto: "형사가 대신 정함" };
+
+/** 조서를 스펙 마크다운으로 찍는다. deep-build·deep-goal이 읽는 줄(고정 항목, 다 됐다는 기준, 결과, 지킬 조건, 하지 않을 것)은 양식을 지킨다. */
+export function renderSpec(state, { summary, early, date = new Date().toISOString().slice(0, 10) }) {
+	const live = liveStatements(state).filter(s => s.status === "confirmed");
+	const byArea = area => live.filter(s => s.area === area).map(s => s.text);
+	const fixed = live.filter(s => s.fixed);
+	const open = openGaps(state);
+	const disputed = liveStatements(state).filter(s => s.status === "disputed");
+	const signedCount = live.filter(s => s.signed === true).length;
+	const autoCount = live.filter(s => s.source === "auto").length;
+	const components = state.components ?? [];
+	const title = state.topic ?? "(주제 없음)";
+	const lines = [
+		`# ${title}${SPEC_SUFFIX}`,
+		"",
+		"## 한눈에 보기",
+		`- 한 문장 요약: ${normalizeText(summary)}`,
+		`- 결과: ${early ? "기준 미달로 조기 종료" : "기준 통과"}`,
+		`- 조서: 확정 ${live.length} (서명으로 확정 ${signedCount} 포함) · 남은 질문 ${open.length + disputed.length}`,
+		`- 턴: ${realTurns(state).length}`,
+		`- 종류: ${state.type === "brownfield" ? "기존 코드 고치기" : "새로 만들기"}`,
+		`- 형사가 대신 정한 진술: ${autoCount}개`,
+		`- 날짜: ${date}`,
+		"",
+		"## 무엇을 만드나",
+		summary.trim(),
+		"",
+	];
+	if (components.length) {
+		lines.push("| 덩어리 | 상태 | 설명 |", "|:---|:---:|:---|");
+		for (const c of components) lines.push(`| ${c.name} | ${c.status === "deferred" ? "미룸" : "진행"} | ${c.description}${c.reason ? ` (${c.reason})` : ""} |`);
+		lines.push("");
+	}
+	lines.push("**고정 항목**", ...(fixed.length ? fixed.map(s => `- \`${s.fixed}\` — ${s.text}`) : ["- 없음"]), "");
+	lines.push("## 왜", ...bullet(byArea("why")), "");
+	lines.push("## 무엇", ...bullet(byArea("what")), "");
+	lines.push("## 경계", "**지킬 조건**", ...bullet(byArea("keep")), "", "**하지 않을 것**", ...bullet(byArea("avoid")), "");
+	lines.push("## 다 됐다는 기준", ...byArea("done").map(text => `- [ ] ${text}`), "");
+	const remaining = [
+		...open.map(gap => `[ ] ${gap.text} — ${AREAS[gap.area]}${gap.why_cost ? `, 틀리면: ${gap.why_cost}` : ""}`),
+		...disputed.map(s => `[ ] 모순 미정리: "${s.text}" vs "${s.dispute?.claim ?? "?"}" — ${AREAS[s.area]}`),
+	];
+	lines.push("## 남은 질문", ...bullet(remaining), "");
+	const code = live.filter(s => s.area === "code");
+	lines.push("## 코드에서 확인한 것", ...bullet(code.map(s => `${s.text}${s.evidence ? ` (근거: ${s.evidence})` : ""}`)), "");
+	lines.push("## 조서", "", "| 번호 | 항목 | 내용 | 출처 | 상태 | 턴 |", "|:---|:---|:---|:---|:---:|---:|");
+	for (const s of state.statements ?? []) {
+		const status = s.status === "retracted" ? `철회(${s.retracted_reason === "superseded" ? `→ ${s.superseded_by}` : s.retracted_reason === "reopened" ? "되물음" : "오기"})` : s.signed ? "서명 확정" : STATUS_LABEL[s.status];
+		lines.push(`| ${s.id} | ${AREAS[s.area]} | ${s.text.replace(/\|/g, "\\|")} | ${SOURCE_LABEL[s.source]} | ${status} | ${s.turn} |`);
+	}
+	lines.push("");
+	const turns = realTurns(state);
+	lines.push("## 문답 기록", "<details>", `<summary>${turns.length} 턴</summary>`, "");
+	for (const t of turns) {
+		lines.push(`### 턴 ${t.turn}`, `- 질문: ${t.question}`, `- 답${t.answer_source === "auto" ? " (형사가 대신)" : ""}: ${t.answer}`, `- 조서: 확정 ${t.counts?.confirmed ?? "?"} · 잠정 ${t.counts?.tentative ?? "?"} · 모순 ${t.counts?.disputed ?? "?"} · 구멍 ${t.counts?.gaps ?? "?"}`, "");
+	}
+	lines.push("</details>", "");
+	return lines.join("\n");
+}
+
+/**
+ * 서명을 확인하고 스펙을 만든 뒤 인터뷰를 끝낸다. 잠정 진술은 서명으로 전부 확정된다.
+ * 조기 종료(--early)면 남은 구멍이 "남은 질문"으로 들어가고 결과 줄이 "기준 미달로 조기 종료"가 된다.
+ */
+function cmdSign(root, sid, flags) {
+	const state = requireActive(root, sid);
+	const early = flags.early === true;
+	const slug = flags.slug;
+	if (!isText(slug) || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) fail("--slug <이름>이 필요합니다 (영어 소문자·숫자·하이픈, 예: leave-request)");
+	const summary_ = readMaybeFile(flags.summary, "--summary");
+	if (!isText(summary_)) fail("--summary <한 문단 요약>이 필요합니다 (길면 @파일경로)");
+	const blocker = signBlocker(root, sid, state, { early });
+	if (blocker) fail(`아직 서명할 수 없습니다: ${blocker}`);
+	const specRel = path.join(DIR_NAME, "specs", `deep-interview-${slug}.md`);
+	const specAbs = path.join(root, specRel);
+	if (fs.existsSync(specAbs)) fail(`스펙 파일이 이미 있습니다: ${specRel}. 다른 --slug를 쓰세요`);
+
+	const turn = lastTurn(state);
+	const signed = [];
+	for (const statement of liveStatements(state)) {
+		if (statement.status !== "tentative") continue;
+		Object.assign(statement, { status: "confirmed", signed: true, confirmed_turn: turn, updated_turn: turn });
+		signed.push(statement.id);
+	}
+	const confirmed = liveStatements(state).filter(s => s.status === "confirmed");
+	state.fixed_items = confirmed.filter(s => s.fixed).map(s => ({ id: s.fixed, statement: s.text, ...(s.component ? { component: s.component } : {}) }));
+	state.summary = normalizeText(summary_);
+	state.early_exit = early;
+	state.signed_at = new Date().toISOString();
+	state.active = false;
+	state.status = "done";
+	state.ended_at = state.signed_at;
+	state.spec_path = specRel;
+
+	fs.mkdirSync(specsDir(root), { recursive: true });
+	fs.writeFileSync(specAbs, renderSpec(state, { summary: summary_, early }));
+	writeState(root, sid, state);
+	return {
+		ok: true,
+		spec_path: specRel,
+		early_exit: early,
+		signed_statements: signed,
+		fixed_items: state.fixed_items.map(item => item.id),
+		criteria: confirmed.filter(s => s.area === "done").length,
+		open_questions: openGaps(state).length + liveStatements(state).filter(s => s.status === "disputed").length,
 		...summary(root, sid, state),
 	};
 }
 
-/** Round 0 결과(덩어리, 고정 항목)를 저장한다. 처음이든 다시 잡든, 직전 범위 확정 뒤에 사용자가 선택지 창에서 "맞아요"를 골라야 한다. */
-function cmdScope(root, sid, flags) {
-	const state = requireActive(root, sid);
-	const input = readInput(flags);
-	// 답 개수로 본다 (같은 순간에 기록돼도 정확함). 다시 잡을 때는 직전 scope 이후의 답이어야 한다.
-	// 그 마지막 답은 선택지 창에서 "맞아요"를 고른 것이어야 한다. 되물음이나 "덩어리 고치기"가 확정으로 세어지지 않게.
-	const answers = readAnswers(root, sid);
-	const answersNow = answers.length;
-	const last = answersNow > (state.answers_at_scope ?? state.answers_at_start ?? 0) ? answers.at(-1) : null;
-	if (!pickedLabel(last, CONFIRM_LABELS.scope)) {
-		fail(
-			`사용자가 선택지 창에서 "${CONFIRM_LABELS.scope}"를 골라 범위를 확인한 기록이 없습니다. 덩어리 표와 고정 항목을 보여주고 AskUserQuestion(선택지 "${CONFIRM_LABELS.scope}", "덩어리 고치기", "일부는 나중에")으로 확인받은 뒤 다시 실행하세요. 채팅으로 답했거나 되물었으면 선택지로 한 번 더 확인받으세요`,
-		);
-	}
+// =============================================================================
+// 명령: end
+// =============================================================================
 
-	if (!Array.isArray(input.components) || input.components.length === 0) fail("components에 덩어리가 하나 이상 있어야 합니다");
-	const ids = new Set();
-	const components = input.components.map(component => {
-		if (!isText(component?.id) || /\s/.test(component.id)) fail("덩어리 id는 공백 없는 문자열이어야 합니다");
-		if (ids.has(component.id)) fail(`덩어리 id가 겹칩니다: ${component.id}`);
-		ids.add(component.id);
-		if (!isText(component.name)) fail(`덩어리 ${component.id}에 name이 필요합니다`);
-		const status = component.status ?? "active";
-		if (!["active", "deferred"].includes(status)) fail(`덩어리 ${component.id}의 status는 active 또는 deferred여야 합니다`);
-		return { id: component.id, name: component.name, description: component.description ?? "", status, reason: component.reason ?? null };
-	});
-	// 이미 체크리스트 답이 있는 덩어리는 지울 수 없다. 범위에서 빼려면 deferred로 바꾼다.
-	for (const id of Object.keys(state.checks ?? {})) {
-		if (!ids.has(id)) fail(`덩어리 ${id}에는 이미 기록이 있어 지울 수 없습니다. status를 deferred로 바꾸세요`);
-	}
-
-	const fixedItems = (input.fixed_items ?? []).map(item => {
-		if (!isText(item?.id) || !isText(item?.statement)) fail("fixed_items의 항목마다 id와 statement가 필요합니다");
-		// component(어느 덩어리의 것인지)는 선택. 적어 두면 그 덩어리를 미뤘을 때 deep-build가 이 항목을 요구하지 않는다.
-		if (item.component !== undefined && !ids.has(item.component)) fail(`fixed_items.${item.id}.component는 덩어리 id 중 하나여야 합니다: ${item.component}`);
-		return { id: item.id, statement: item.statement, ...(item.component !== undefined ? { component: item.component } : {}) };
-	});
-
-	if (input.type !== undefined) {
-		if (!(input.type in WEIGHTS)) fail('type은 "greenfield" 또는 "brownfield"여야 합니다');
-		if (state.rounds.length > 0 && input.type !== state.type) fail("라운드를 기록한 뒤에는 type을 바꿀 수 없습니다");
-		state.type = input.type;
-	}
-	if (state.scope_confirmed_at) {
-		state.scope_history.push({ at: new Date().toISOString(), components: state.components, fixed_items: state.fixed_items });
-	}
-	if (!components.some(component => component.status === "active")) fail("진행 중(active)인 덩어리가 하나 이상 있어야 합니다. 전부 미루면 물을 것이 없습니다");
-	state.components = components;
-	state.fixed_items = fixedItems;
-	state.scope_confirmed_at = new Date().toISOString();
-	state.answers_at_scope = answersNow;
-	const evaluation = evaluateState(state);
-	state.current_ambiguity = evaluation.ambiguity;
-	writeState(root, sid, state);
-	return { ok: true, ...summary(root, sid, state), next: suggestNext(state) };
-}
-
-/** 체크리스트 답을 검증하고 상태에 반영한다. */
-function applyChecks(state, checks, roundNumber) {
-	if (!checks || typeof checks !== "object" || Array.isArray(checks)) fail("checks는 { 덩어리id: { 체크id: 근거 또는 false } } 형태여야 합니다");
-	const dimensions = new Set(dimensionsFor(state.type));
-	const componentIds = new Set(state.components.map(component => component.id));
-	for (const [componentId, answers] of Object.entries(checks)) {
-		if (!componentIds.has(componentId)) fail(`없는 덩어리입니다: ${componentId}`);
-		if (!answers || typeof answers !== "object") fail(`checks.${componentId}는 객체여야 합니다`);
-		for (const [checkId, value] of Object.entries(answers)) {
-			const dimension = CHECK_DIMENSION[checkId];
-			if (!dimension) fail(`없는 체크 질문입니다: ${checkId}`);
-			if (!dimensions.has(dimension)) fail(`${checkId}는 이 인터뷰(${state.type})에서 쓰지 않는 항목입니다`);
-			if (value !== false && !isText(value)) fail(`${componentId}.${checkId}: "예"는 근거 문자열, "아니오"는 false로 적으세요`);
-			state.checks[componentId] ??= {};
-			const next = value === false ? { yes: false, round: roundNumber } : { yes: true, evidence: value, round: roundNumber };
-			// 값이 그대로면 처음 찍은 라운드를 유지한다. 나중 라운드를 번복할 때 앞 라운드에서 확정한 체크까지 지워지지 않게.
-			const prev = state.checks[componentId][checkId];
-			if (prev && prev.yes === next.yes && (prev.evidence ?? null) === (next.evidence ?? null)) continue;
-			state.checks[componentId][checkId] = next;
-		}
-	}
-}
-
-/** 사실 추가·뒤집힘·재확인·대체를 반영한다. 사실은 지우지 않는다. */
-function applyFacts(state, input, roundNumber) {
-	const byId = id => state.facts.find(fact => fact.id === id);
-	for (const fact of input.facts ?? []) {
-		if (!isText(fact?.id) || !isText(fact?.statement)) fail("facts의 항목마다 id와 statement가 필요합니다");
-		const existing = byId(fact.id);
-		if (existing) {
-			// 같은 id로 다시 보낸 사실은 이번 라운드의 답으로 다시 확정된 것이다. 라운드도 이번 것으로 옮겨서,
-			// 이번 라운드를 번복하면 이 사실이 뒤집히고, 앞서 뒤집혔던 상태는 풀린다. 이전 문장은 history에 남긴다.
-			if (existing.statement !== fact.statement) existing.history = [...(existing.history ?? []), { statement: existing.statement, round: existing.round }];
-			Object.assign(existing, { statement: fact.statement, evidence: fact.evidence ?? existing.evidence, round: roundNumber, status: "active", superseded_by: null });
-		} else state.facts.push({ id: fact.id, statement: fact.statement, evidence: fact.evidence ?? null, round: roundNumber, status: "active", superseded_by: null });
-	}
-	for (const id of input.dispute ?? []) {
-		const fact = byId(id) ?? fail(`없는 사실입니다: ${id}`);
-		if (fact.status === "active") fact.status = "disputed";
-	}
-	for (const id of input.confirm ?? []) {
-		const fact = byId(id) ?? fail(`없는 사실입니다: ${id}`);
-		if (fact.status === "disputed") fact.status = "active";
-	}
-	for (const pair of input.supersede ?? []) {
-		const old = byId(pair?.old) ?? fail(`없는 사실입니다: ${pair?.old}`);
-		if (!byId(pair?.new)) fail(`대체할 새 사실이 없습니다: ${pair?.new}. 먼저 facts에 넣으세요`);
-		old.status = "superseded";
-		old.superseded_by = pair.new;
-	}
-}
-
-/**
- * 라운드 하나를 기록하고 모호도를 계산한다.
- * 이미 기록한 라운드 번호를 다른 답으로 다시 보내면 "답 번복"으로 보고, 그 라운드의 사실을 뒤집힘으로 표시한다.
- */
-function cmdRecord(root, sid, flags) {
-	const state = requireActive(root, sid);
-	if (!state.scope_confirmed_at) fail("Round 0 범위가 확정되지 않았습니다. scope부터 실행하세요");
-	const input = readInput(flags);
-
-	const lastRound = state.rounds.at(-1)?.round ?? 0;
-	const roundNumber = input.round;
-	const previous = state.rounds.find(round => round.round === roundNumber);
-	if (!Number.isInteger(roundNumber) || roundNumber < 1) fail("round는 1 이상의 정수여야 합니다");
-	if (!previous && roundNumber !== lastRound + 1) fail(`다음 라운드 번호는 ${lastRound + 1}입니다`);
-	const component = state.components.find(c => c.id === input.component);
-	if (!component) fail(`component는 덩어리 id 중 하나여야 합니다: ${input.component}`);
-	if (component.status === "deferred") fail(`${input.component}는 미룬(deferred) 덩어리라 라운드를 기록할 수 없습니다. 다시 다루려면 사용자에게 확인받고 scope로 active로 바꾸세요`);
-	if (!dimensionsFor(state.type).includes(input.dimension)) fail(`dimension은 ${dimensionsFor(state.type).join(", ")} 중 하나여야 합니다`);
-	if (!isText(input.question) || !isText(input.answer)) fail("question과 answer가 필요합니다");
-	const source = input.answer_source ?? "user";
-	if (!["user", "refined", "cited", "auto"].includes(source)) fail("answer_source는 user, refined, cited, auto 중 하나여야 합니다");
-	if (!input.checks?.[input.component] || Object.keys(input.checks[input.component]).length === 0) {
-		fail(`이번에 물은 덩어리(${input.component})의 체크리스트 답이 checks에 있어야 합니다`);
-	}
-
-	const before = state.current_ambiguity;
-	const beforeMilestone = state.milestone;
-	const retracted = previous && previous.answer !== input.answer;
-	if (previous) {
-		// 같은 라운드를 다시 기록하면 그 라운드에서 찍은 체크는 일단 지운다 (번복이든 체크 정정이든).
-		// 이전 값은 복원하지 않고 "아직 답 안 함"으로 되돌린다 (점수가 낮아지는 쪽이 안전하다).
-		for (const answers of Object.values(state.checks)) {
-			for (const [checkId, check] of Object.entries(answers)) if (check.round === roundNumber) delete answers[checkId];
-		}
-	}
-	if (retracted) {
-		// 번복된 답을 근거로 한 사실은 뒤집힘으로 표시한다. 이번 요청의 facts에 같은 id가 있으면 applyFacts가 다시 active로 돌린다.
-		for (const fact of state.facts) if (fact.round === roundNumber && fact.status === "active") fact.status = "disputed";
-	}
-	applyChecks(state, input.checks, roundNumber);
-	applyFacts(state, input, roundNumber);
-
-	const record = {
-		round: roundNumber,
-		component: input.component,
-		dimension: input.dimension,
-		question: input.question,
-		answer: input.answer,
-		answer_source: source,
-		reason: input.reason ?? null,
-		checks: input.checks,
-		events: input.events ?? [],
-		notes: input.notes ?? null,
-		recorded_at: new Date().toISOString(),
-		// 이 라운드를 기록할 때까지 쌓인 사용자 답 수. 마무리 확인 답이 그 뒤에 왔는지 셀 때 쓴다.
-		answers_seen: readAnswers(root, sid).length,
-	};
-	if (previous) state.rounds[state.rounds.indexOf(previous)] = record;
-	else state.rounds.push(record);
-
-	// 이 라운드를 넣은 뒤에 계산한다. AI 대리 답 비율(최저선)에 이번 라운드가 바로 반영되게 하기 위해서다.
-	const evaluation = evaluateState(state);
-	Object.assign(record, { ambiguity_raw: evaluation.raw, floor: evaluation.floor, ambiguity: evaluation.ambiguity });
-
-	state.current_ambiguity = evaluation.ambiguity;
-	state.milestone = milestoneFor(evaluation.ambiguity, state.threshold);
-
-	let autoStreak = 0;
-	for (let i = state.rounds.length - 1; i >= 0 && state.rounds[i].answer_source === "auto"; i -= 1) autoStreak += 1;
-	// 정체: 기준을 아직 못 넘었는데 최근 3라운드 동안 모호도가 거의 안 움직였거나, 덩어리 수에 비해 라운드가 많이 지났는데도 높다.
-	// 덩어리가 많으면 한 라운드에 전체 평균이 조금씩만 내려가므로 라운드 기준을 덩어리 수에 맞춘다.
-	const activeCount = state.components.filter(c => c.status !== "deferred").length;
-	const recent = state.rounds.slice(-3).map(round => round.ambiguity);
-	const stalled =
-		!evaluation.threshold_met &&
-		((recent.length === 3 && Math.max(...recent) - Math.min(...recent) <= 0.05) || (roundNumber >= Math.max(8, 3 * activeCount) && evaluation.ambiguity > 0.3));
-
-	writeState(root, sid, state);
-	return {
-		ok: true,
-		round: roundNumber,
-		retracted: Boolean(retracted),
-		scores: scoreTable(state),
-		ambiguity_before: before,
-		ambiguity_raw: evaluation.raw,
-		floor: evaluation.floor,
-		floor_reasons: evaluation.floor_reasons,
-		ambiguity: evaluation.ambiguity,
-		clamped_by_floor: evaluation.clamped,
-		threshold: state.threshold,
-		threshold_met: evaluation.threshold_met,
-		per_component: evaluation.per_component,
-		lagging_components: evaluation.lagging,
-		milestone: state.milestone,
-		milestone_changed: beforeMilestone !== state.milestone ? `${beforeMilestone} → ${state.milestone}` : null,
-		must_ask_user: autoStreak >= 3,
-		rethink_core: stalled,
-		hard_cap: roundNumber >= HARD_CAP_ROUNDS,
-		components: componentProgress(state),
-		next: suggestNext(state),
-	};
-}
-
-/** 기준값에 닿기 전에 끝내기로 했을 때 표시한다. 3라운드 이후(또는 최대 라운드)에만 허용한다. */
-function cmdEarlyExit(root, sid) {
-	const state = requireActive(root, sid);
-	const rounds = state.rounds.length;
-	if (rounds < EARLY_EXIT_MIN_ROUNDS && rounds < HARD_CAP_ROUNDS) {
-		fail(`조기 종료는 ${EARLY_EXIT_MIN_ROUNDS}라운드부터 가능합니다. 지금까지 ${rounds}라운드입니다`);
-	}
-	state.early_exit = true;
-	writeState(root, sid, state);
-	return { ok: true, early_exit: true, ...summary(root, sid, state) };
-}
-
-/** 현재 상태를 보여준다. 이어하기와 훅 동작 확인(answers_recorded)에 쓴다. */
-function cmdStatus(root, sid) {
-	const state = readState(root, sid);
-	if (!state) return { ok: true, exists: false, active: false };
-	return { ok: true, exists: true, ...summary(root, sid, state), next: isActive(state) ? suggestNext(state) : null, state };
-}
-
-/**
- * 인터뷰를 끝낸다. 기록은 남기고 차단만 푼다.
- * done(정상 종료)은 스펙 저장과 같은 조건을 통과해야 한다. 사용자가 그만둘 때는 cancelled를 쓴다.
- */
+/** 용의자가 그만둘 때. 기록은 남기고 차단만 푼다. 정상 종료는 sign으로만 한다. */
 function cmdEnd(root, sid, flags) {
 	const state = readState(root, sid);
 	if (!state) return { ok: true, ended: false, active: false };
-	const status = flags.status ?? "done";
-	if (!["done", "cancelled"].includes(status)) fail("--status는 done 또는 cancelled여야 합니다");
+	const status = flags.status ?? "cancelled";
+	if (status === "done") fail("정상 종료는 sign --slug <이름> --summary <요약>으로 합니다 (스펙을 코드가 만듭니다)");
+	if (status !== "cancelled") fail("--status는 cancelled만 받습니다");
 	const wasActive = isActive(state);
-	if (wasActive && status === "done") {
-		const blocker = completionBlocker(root, sid, state);
-		if (blocker) fail(`아직 정상 종료할 수 없습니다: ${blocker} 사용자가 그만두기로 했다면 --status cancelled를 쓰세요.`);
-		// 정상 종료는 스펙 경로를 남겨야 한다. deep-build가 이 경로로 인터뷰 기록을 찾아 고정 항목·조기 종료를 대조한다.
-		if (!isText(flags.spec)) fail("정상 종료(done)에는 --spec <저장한 스펙 경로>가 필요합니다");
-		if (!fs.existsSync(path.resolve(root, flags.spec))) fail(`스펙 파일이 없습니다: ${flags.spec}. 먼저 스펙을 저장하세요`);
-	}
 	if (wasActive) {
 		state.active = false;
-		state.status = status;
+		state.status = "cancelled";
 		state.ended_at = new Date().toISOString();
-		if (isText(flags.spec)) state.spec_path = flags.spec;
 		writeState(root, sid, state);
 	}
-	return { ok: true, ended: wasActive, ...summary(root, sid, state) };
+	return { ok: true, ended: wasActive, active: state.active, status: state.status, topic: state.topic };
 }
 
-const COMMANDS = { start: cmdStart, scope: cmdScope, record: cmdRecord, "early-exit": cmdEarlyExit, status: cmdStatus, end: cmdEnd };
+const COMMANDS = { start: cmdStart, note: cmdNote, board: cmdBoard, review: cmdReview, sign: cmdSign, end: cmdEnd };
 
 /** 명령을 실행하고 결과 객체를 돌려준다. 테스트에서도 이 함수를 직접 부른다. */
 export function run(argv, cwd = process.cwd()) {

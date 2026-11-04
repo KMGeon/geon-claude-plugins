@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { CORE_IDS, SID, allYes, choose, cli, confirmSpec, recordRound, say, startWithScope, tempProject } from "./helpers.mjs";
+import { SID, cli, input, readyInterview, say, sign, tempProject } from "./helpers.mjs";
 import { evaluate } from "../hooks/guard.mjs";
 import { run } from "../skills/deep-interview/scripts/interview.mjs";
 
@@ -67,42 +67,14 @@ test("프로젝트 밖 임시 폴더는 허용하고, 프로젝트 안은 막는
 	assert.match(call(root, "Write", { file_path: path.join(root, "notes.md") }), /딥 인터뷰 진행 중/);
 });
 
-test("스펙 저장: 기록이 없으면 막는다", () => {
-	const root = tempProject();
-	startWithScope(root);
-	assert.match(call(root, "Write", { file_path: spec(root) }), /기록된 라운드가 없습니다/);
-});
-
-test("스펙 저장: 모호도가 기준보다 높으면 막고, 조기 종료 표시 후에는 허용한다", () => {
-	const root = tempProject();
-	startWithScope(root);
-	for (const round of [1, 2, 3]) recordRound(root, round, { g1: "근거" });
-	say(root, "이 정도면 됐어");
-	assert.match(call(root, "Write", { file_path: spec(root) }), /기준값 20%보다 높습니다/);
-	cli(root, "early-exit");
-	// 조기 종료여도 한 문장 맞춰 보기 확인("네, 이대로" 선택)은 있어야 한다.
-	assert.match(call(root, "Write", { file_path: spec(root) }), /"네, 이대로"를 고른 기록이 없습니다/);
-	confirmSpec(root);
+test("스펙 폴더도 인터뷰 중에는 직접 쓸 수 없다. 스펙은 sign 명령이 만들고, 끝난 뒤에는 막지 않는다", () => {
+	const root = readyInterview(tempProject());
+	assert.match(call(root, "Write", { file_path: spec(root) }), /딥 인터뷰 진행 중/);
+	cli(root, "review", ...input({}));
+	sign(root);
+	assert.match(call(root, "Write", { file_path: spec(root) }), /딥 인터뷰 진행 중/);
+	cli(root, "sign", "--slug", "x", "--summary", "요약");
 	assert.equal(call(root, "Write", { file_path: spec(root) }), null);
-});
-
-test("스펙 저장: 마지막 라운드 뒤 사용자가 선택지 창에서 '네, 이대로'를 골라야 한다", () => {
-	const root = tempProject();
-	startWithScope(root);
-	recordRound(root, 1, allYes(CORE_IDS));
-	assert.match(call(root, "Write", { file_path: spec(root) }), /고른 기록이 없습니다/);
-	// 되물음, 채팅 답, 다른 선택지는 확인이 아니다.
-	say(root, "그게 무슨 뜻이에요?");
-	assert.match(call(root, "Write", { file_path: spec(root) }), /고른 기록이 없습니다/);
-	say(root, "네, 이대로");
-	assert.match(call(root, "Write", { file_path: spec(root) }), /고른 기록이 없습니다/);
-	choose(root, "확인", "표현 고치기");
-	assert.match(call(root, "Write", { file_path: spec(root) }), /고른 기록이 없습니다/);
-	confirmSpec(root);
-	assert.equal(call(root, "Write", { file_path: spec(root) }), null);
-	// 확인 뒤에 사용자가 다른 말을 하면 다시 확인받아야 한다.
-	say(root, "아 잠깐, 하나 더");
-	assert.match(call(root, "Write", { file_path: spec(root) }), /고른 기록이 없습니다/);
 });
 
 test("다른 세션은 막지 않는다", () => {
@@ -136,7 +108,7 @@ test("cd로 다른 저장소에 가도 이 세션의 인터뷰가 막는다 (세
 	assert.match(evaluate({ session_id: SID, cwd: elsewhere, tool_name: "Bash", tool_input: { command: "npm test" } }), /딥 인터뷰 진행 중/);
 	assert.match(evaluate({ session_id: SID, cwd: elsewhere, tool_name: "Write", tool_input: { file_path: sourceFile } }), /딥 인터뷰 진행 중/);
 	assert.equal(say(elsewhere, "맞아요"), true);
-	assert.equal(run(["status", "--session", SID], elsewhere).answers_recorded, 1);
+	assert.equal(run(["board", "--session", SID], elsewhere).answers_recorded, 1);
 	assert.equal(run(["start", "--session", SID], elsewhere).already_active, true);
 	assert.equal(fs.existsSync(path.join(elsewhere, ".deep-interview")), false);
 });
