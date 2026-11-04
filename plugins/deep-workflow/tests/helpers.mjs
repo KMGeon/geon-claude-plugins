@@ -44,35 +44,34 @@ export function choose(root, header, label) {
 	});
 }
 
-/** 사용자가 범위 확인 선택지 창에서 "맞아요"를 고른 것처럼 기록한다. */
-export function confirmScope(root) {
-	return choose(root, "범위 확인", "맞아요 (추천)");
+/** 사용자가 조서 낭독 선택지 창에서 "서명"을 고른 것처럼 기록한다. */
+export function sign(root) {
+	return choose(root, "조서", "서명 (추천)");
 }
 
-/** 사용자가 한 문장 맞춰 보기 선택지 창에서 "네, 이대로"를 고른 것처럼 기록한다. */
-export function confirmSpec(root) {
-	return choose(root, "확인", "네, 이대로 (추천)");
+/** 인터뷰를 시작한다. 기본은 새로 만들기(greenfield). */
+export function start(root, ...flags) {
+	return cli(root, "start", "--topic", "휴가 신청", ...flags);
 }
 
-/** 모든 체크에 "예"(근거 포함)로 답한 체크리스트. */
-export function allYes(ids) {
-	return Object.fromEntries(ids.map(id => [id, `${id} 근거`]));
+/** 사용자 진술 하나. */
+export const said = (text, area, extra = {}) => ({ text, area, source: "user", ...extra });
+/** 형사가 정리한 진술 하나. */
+export const inferred = (text, area, extra = {}) => ({ text, area, source: "inferred", ...extra });
+
+/** 턴 하나를 적는다. 질문·답은 자동으로 채운다. */
+export function note(root, turn, body = {}) {
+	return cli(root, "note", ...input({ turn, question: `질문 ${turn}`, answer: `답 ${turn}`, ...body }));
 }
 
-export const CORE_IDS = ["g0", "g1", "g2", "g3", "c1", "c2", "c3", "s1", "s2", "s3"];
-
-/** 인터뷰를 시작하고 덩어리 하나(app)로 범위를 확정한다. */
-export function startWithScope(root, { components = [{ id: "app", name: "앱" }], flags = [] } = {}) {
-	cli(root, "start", "--topic", "휴가 신청", ...flags);
-	confirmScope(root);
-	return cli(root, "scope", ...input({ components, fixed_items: [{ id: "화면:신청폼", statement: "신청 화면" }] }));
-}
-
-/** 다음 라운드를 기록한다. */
-export function recordRound(root, round, checks, extra = {}) {
-	return cli(
-		root,
-		"record",
-		...input({ round, component: "app", dimension: "goal", question: `질문 ${round}`, answer: `답 ${round}`, checks: { app: checks }, ...extra }),
-	);
+/**
+ * 새로 만들기 인터뷰에서 낭독 조건(구멍 0·모순 0·항목마다 진술)을 맞춘 상태로 만든다.
+ * 턴 1~3에서 왜·무엇(고정 항목)·지킬 조건·완료 기준을 사용자 말로 적는다.
+ */
+export function readyInterview(root) {
+	start(root);
+	note(root, 1, { statements: [said("휴가 신청이 메일이라 누락됨", "why"), said("직원이 웹에서 연차를 신청한다", "what", { fixed: "화면:신청폼" })] });
+	note(root, 2, { statements: [said("기존 로그인 그대로 쓴다", "keep"), said("반차는 이번에 안 한다", "avoid")] });
+	note(root, 3, { statements: [said("신청하면 목록에 '대기'로 보인다", "done")] });
+	return root;
 }
